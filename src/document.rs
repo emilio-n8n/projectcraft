@@ -1,10 +1,12 @@
 //! Project document model.
 //!
-//! A document is a small, self-contained project plan. Every value is stored
-//! in plain integer days: no calendar, timezone or external date crate is
-//! needed to schedule it.
+//! A document is a small, self-contained project plan. Every scheduling value
+//! is stored in plain integer days. Newer, optional presentation fields use
+//! `#[serde(default)]` so projects written by v0.1.0 still load under schema 1.
 
 use serde::{Deserialize, Serialize};
+
+use crate::calendar::Calendar;
 
 /// A single planned task.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -21,6 +23,18 @@ pub struct Task {
     pub dependencies: Vec<u64>,
     /// Completion ratio, from `0.0` (not started) to `1.0` (done).
     pub progress: f32,
+    /// A milestone is a zero-duration marker drawn as a diamond.
+    #[serde(default)]
+    pub milestone: bool,
+    /// Free-form task notes.
+    #[serde(default)]
+    pub notes: String,
+    /// Assigned resource or team.
+    #[serde(default)]
+    pub resource: String,
+    /// Estimated cost in project currency units.
+    #[serde(default)]
+    pub cost: f64,
 }
 
 /// A versioned project plan owned by the application.
@@ -32,6 +46,9 @@ pub struct Document {
     pub tasks: Vec<Task>,
     /// Next identifier handed out by [`Document::add_task`].
     pub next_id: u64,
+    /// Optional real-date settings for the Gantt ruler.
+    #[serde(default)]
+    pub calendar: Calendar,
 }
 
 impl Default for Document {
@@ -40,6 +57,7 @@ impl Default for Document {
             title: "Untitled".into(),
             tasks: Vec::new(),
             next_id: 1,
+            calendar: Calendar::default(),
         }
     }
 }
@@ -59,6 +77,10 @@ impl Document {
                     duration_days: 2,
                     dependencies: Vec::new(),
                     progress: 1.0,
+                    milestone: false,
+                    notes: "Interviews with the operations team.".into(),
+                    resource: "Product owner".into(),
+                    cost: 1_200.0,
                 },
                 Task {
                     id: 2,
@@ -67,6 +89,10 @@ impl Document {
                     duration_days: 3,
                     dependencies: vec![1],
                     progress: 0.8,
+                    milestone: false,
+                    notes: String::new(),
+                    resource: "Designer".into(),
+                    cost: 2_400.0,
                 },
                 Task {
                     id: 3,
@@ -75,6 +101,10 @@ impl Document {
                     duration_days: 5,
                     dependencies: vec![2],
                     progress: 0.3,
+                    milestone: false,
+                    notes: "Server work and data migration.".into(),
+                    resource: "Engineering".into(),
+                    cost: 8_000.0,
                 },
                 Task {
                     id: 4,
@@ -83,6 +113,10 @@ impl Document {
                     duration_days: 2,
                     dependencies: vec![3],
                     progress: 0.0,
+                    milestone: false,
+                    notes: String::new(),
+                    resource: "QA".into(),
+                    cost: 1_500.0,
                 },
                 Task {
                     id: 5,
@@ -91,8 +125,13 @@ impl Document {
                     duration_days: 4,
                     dependencies: vec![2],
                     progress: 0.1,
+                    milestone: false,
+                    notes: String::new(),
+                    resource: "Technical writer".into(),
+                    cost: 900.0,
                 },
             ],
+            calendar: Calendar::default(),
         }
     }
 
@@ -107,8 +146,50 @@ impl Document {
             duration_days: 1,
             dependencies: Vec::new(),
             progress: 0.0,
+            milestone: false,
+            notes: String::new(),
+            resource: String::new(),
+            cost: 0.0,
         });
         id
+    }
+
+    /// Append a zero-duration milestone that depends on `after`, if given.
+    pub fn add_milestone(&mut self, after: Option<u64>) -> u64 {
+        let id = self.add_task();
+        if let Some(task) = self.task_mut(id) {
+            task.name = format!("Milestone {id}");
+            task.duration_days = 0;
+            task.milestone = true;
+            task.dependencies = after.into_iter().collect();
+        }
+        id
+    }
+
+    /// Copy a task with a fresh identifier and return the new identifier.
+    pub fn duplicate_task(&mut self, id: u64) -> Option<u64> {
+        let mut copy = self.task(id)?.clone();
+        let new_id = self.add_task();
+        copy.id = new_id;
+        copy.name = format!("{} (copy)", copy.name);
+        if let Some(original) = self.task_mut(new_id) {
+            *original = copy;
+        }
+        Some(new_id)
+    }
+
+    /// Move a task up (`-1`) or down (`+1`) in display order.
+    pub fn move_task(&mut self, id: u64, delta: isize) -> bool {
+        let Some(index) = self.tasks.iter().position(|task| task.id == id) else {
+            return false;
+        };
+        let target = index as isize + delta;
+        if target < 0 || target >= self.tasks.len() as isize {
+            return false;
+        }
+        let task = self.tasks.remove(index);
+        self.tasks.insert(target as usize, task);
+        true
     }
 
     /// Remove a task and drop its identifier from every dependency list.
@@ -136,6 +217,12 @@ impl Document {
     /// Find a task by identifier for editing.
     pub fn task_mut(&mut self, id: u64) -> Option<&mut Task> {
         self.tasks.iter_mut().find(|task| task.id == id)
+    }
+
+    /// Sum of the estimated task costs.
+    #[must_use]
+    pub fn total_cost(&self) -> f64 {
+        self.tasks.iter().map(|task| task.cost).sum()
     }
 }
 
@@ -200,6 +287,48 @@ mod tests {
     }
 
     #[test]
+    fn legacy_schema_one_json_loads_with_defaults() {
+        let legacy = r#"{
+            "title": "Old project",
+            "tasks": [{
+                "id": 1, "name": "Old task", "start_day": 0,
+                "duration_days": 2, "dependencies": [], "progress": 0.5
+            }],
+            "next_id": 2
+        }"#;
+        let document: Document = serde_json::from_str(legacy).expect("legacy project");
+        assert_eq!(document.title, "Old project");
+        assert_eq!(document.calendar, Calendar::default());
+        let task = &document.tasks[0];
+        assert!(!task.milestone);
+        assert!(task.notes.is_empty());
+        assert!(task.resource.is_empty());
+        assert_eq!(task.cost, 0.0);
+    }
+
+    #[test]
+    fn milestone_duplicate_and_reorder() {
+        let mut document = Document::sample();
+        let milestone = document.add_milestone(Some(4));
+        let task = document.task(milestone).expect("milestone");
+        assert!(task.milestone);
+        assert_eq!(task.duration_days, 0);
+        assert_eq!(task.dependencies, vec![4]);
+
+        let copy = document.duplicate_task(1).expect("copy");
+        assert_eq!(
+            document.task(copy).expect("copy task").name,
+            "Requirements (copy)"
+        );
+        assert!(document.move_task(copy, -1));
+        assert_eq!(
+            document.tasks.iter().position(|task| task.id == copy),
+            Some(5)
+        );
+        assert!(!document.move_task(999, -1));
+    }
+
+    #[test]
     fn dependency_field_round_trip() {
         assert_eq!(
             parse_dependencies("1, 3; 2  3").expect("parse"),
@@ -235,5 +364,28 @@ mod tests {
         assert_eq!(host.document().tasks[1].name, original);
         assert!(host.redo());
         assert_eq!(host.document().tasks[1].name, "Detailed design");
+    }
+
+    #[test]
+    fn drag_gesture_is_one_undo_step() {
+        let mut host =
+            craftkit_io::DocumentHost::new(Document::sample(), "projectcraft", 1, "0.1.0");
+        let original = host.document().task(3).expect("task").start_day;
+
+        host.history_mut().begin_gesture();
+        for delta in [1_i64, 2, 3] {
+            if let Some(task) = host.history_mut().current_mut().task_mut(3) {
+                task.start_day = original + delta;
+            }
+        }
+        host.history_mut().end_gesture();
+
+        assert_eq!(host.history().undo_depth(), 1);
+        assert_eq!(
+            host.document().task(3).expect("task").start_day,
+            original + 3
+        );
+        assert!(host.undo());
+        assert_eq!(host.document().task(3).expect("task").start_day, original);
     }
 }

@@ -3,8 +3,11 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod app;
+mod calendar;
 mod csv;
 mod document;
+mod gantt;
+mod pdf;
 mod schedule;
 
 use craftkit_ui::cli::{self, CliAction};

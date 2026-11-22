@@ -12,15 +12,22 @@ desktop foundation.
 ## Features
 
 - Native Rust desktop UI (egui/eframe), no web runtime.
-- Editable task table: name, start day, duration, dependencies (`1,2`) and
-  progress. Add and delete tasks; deleting one repairs the dependency graph.
+- Editable, sortable task table: name, start day, duration, dependencies (`1,2`)
+  and progress. Add, duplicate, reorder and delete tasks; deleting one repairs
+  the dependency graph.
 - Critical Path Method in whole days: earliest/latest start and finish, total
   float and critical-path detection with clear cycle diagnostics.
-- Gantt canvas drawn with egui's `Painter`: day ruler, per-task bars, progress
-  overlay, slack markers and colour-coded critical tasks.
-- CSV export of authored fields plus computed CPM dates, with proper quoting.
+- Interactive Gantt drawn with egui's `Painter`: dependency arrows, row
+  selection, bar dragging to reschedule, day/week/month/fit zoom, horizontal
+  scrolling, progress overlay, slack markers and colour-coded critical tasks.
+- Optional calendar: a project start date and weekend skipping display real
+  dates on the ruler without changing integer-day scheduling.
+- Task milestones (zero-duration diamonds), notes, resources and estimated
+  costs; the total cost is shown in the status line.
+- CSV import and export with RFC-style quoting and descriptive row errors.
+- Vector PDF export of the Gantt for printing, with no extra dependency.
 - Versioned JSON project files with atomic saves and schema validation.
-- Bounded undo/redo through the shared document history.
+- Bounded undo/redo through the shared document history; a bar drag is one step.
 - Recent files and persisted preferences.
 - Offline-first: no account, no telemetry, no network required.
 
@@ -52,10 +59,13 @@ Linux windowing development packages are installed by the CI workflow.
 
 ```text
 src/main.rs       CLI and window startup
-src/app.rs        UI, menus and project lifecycle
+src/app.rs        UI, interactive Gantt and project lifecycle
 src/document.rs   task/document model and field parsing
 src/schedule.rs   CPM forward/backward passes and validation
-src/csv.rs        CSV export with quoting
+src/calendar.rs   optional real dates and weekend skipping
+src/gantt.rs      zoom, hit-testing and arrow geometry
+src/csv.rs        CSV import/export with quoting
+src/pdf.rs        dependency-free vector Gantt export
 ```
 
 The application depends on pinned CraftKit crates from Git. Keep the tag in
@@ -79,17 +89,23 @@ Projects are JSON envelopes:
         "start_day": 0,
         "duration_days": 2,
         "dependencies": [],
-        "progress": 1.0
+        "progress": 1.0,
+        "milestone": false,
+        "notes": "",
+        "resource": "",
+        "cost": 0.0
       }
     ],
-    "next_id": 2
+    "next_id": 2,
+    "calendar": { "start_date": null, "skip_weekends": false }
   }
 }
 ```
 
-Days are signed integers (no calendar dates), `start_day` is a release
-constraint and durations are whole days. The application owns the `document`
-schema and its migrations. A newer `schema_version` is rejected instead of
+Days are signed integers; `start_day` is a release constraint and durations are
+whole days. The optional `calendar` maps day offsets to real dates for display.
+Fields added in v0.2 have serde defaults, so schema 1 files written by v0.1.0
+still open without a migration. A newer `schema_version` is rejected instead of
 being silently misread.
 
 ## Licence

@@ -259,6 +259,10 @@ mod tests {
             duration_days: duration,
             dependencies: dependencies.to_vec(),
             progress: 0.0,
+            milestone: false,
+            notes: String::new(),
+            resource: String::new(),
+            cost: 0.0,
         }
     }
 
@@ -273,6 +277,7 @@ mod tests {
                 task(3, "C", 0, 2, &[1]),
                 task(4, "D", 0, 3, &[2, 3]),
             ],
+            ..Document::default()
         };
 
         let result = schedule(&document).expect("valid plan");
@@ -318,6 +323,7 @@ mod tests {
             title: "Cycle".into(),
             next_id: 3,
             tasks: vec![task(1, "Design", 0, 1, &[2]), task(2, "Build", 0, 1, &[1])],
+            ..Document::default()
         };
         let error = schedule(&document).expect_err("cycle");
         assert!(error.contains("cycle"), "{error}");
@@ -331,6 +337,7 @@ mod tests {
             title: "Missing".into(),
             next_id: 2,
             tasks: vec![task(1, "A", 0, 1, &[99])],
+            ..Document::default()
         };
         assert!(
             schedule(&missing)
@@ -342,6 +349,7 @@ mod tests {
             title: "Negative".into(),
             next_id: 2,
             tasks: vec![task(1, "A", 0, -1, &[])],
+            ..Document::default()
         };
         assert!(
             schedule(&negative)
@@ -356,6 +364,7 @@ mod tests {
             title: "Release".into(),
             next_id: 3,
             tasks: vec![task(1, "Early", 0, 2, &[]), task(2, "Late", 7, 3, &[1])],
+            ..Document::default()
         };
         let result = schedule(&document).expect("valid");
         let late = result.task(2).expect("late");

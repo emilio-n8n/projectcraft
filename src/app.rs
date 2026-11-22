@@ -1,4 +1,4 @@
-//! ProjectCraft UI: task table, Gantt canvas and project lifecycle.
+//! ProjectCraft UI: task table, interactive Gantt and project lifecycle.
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;
@@ -8,29 +8,25 @@ use craftkit_ui::cli::CliOptions;
 use craftkit_ui::eframe::{self, egui};
 use craftkit_ui::egui::{
     Align, Align2, CornerRadius, DragValue, FontFamily, FontId, Layout, Rect, RichText, ScrollArea,
-    Sense, Stroke, TextEdit, Vec2, pos2, vec2,
+    Sense, Shape, Stroke, TextEdit, Vec2, pos2, vec2,
 };
 use craftkit_ui::{AppIdentity, AppShell, Tone, dialogs, theme, widgets};
 
-use crate::csv::export_csv as write_csv;
+use crate::calendar::Date;
+use crate::csv::{export_csv as write_csv, import_csv};
 use crate::document::{Document, format_dependencies, parse_dependencies};
+use crate::gantt::{
+    HEADER_HEIGHT, LABEL_WIDTH, ROW_HEIGHT, Zoom, arrow_points, bar_rect, day_x, drag_delta_days,
+    row_at,
+};
+use crate::pdf::export_pdf;
 use crate::schedule::{Schedule, schedule};
 
 const FORMAT: &str = "projectcraft";
 const SCHEMA_VERSION: u32 = 1;
 const APP_VERSION: &str = env!("CARGO_PKG_VERSION");
 
-/// Day scale of the Gantt canvas, in pixels per day.
-const DAY_WIDTH: f32 = 18.0;
-/// Width of the task-name gutter on the Gantt canvas.
-const LABEL_WIDTH: f32 = 175.0;
-/// Height of one Gantt row.
-const ROW_HEIGHT: f32 = 22.0;
-/// Height of the day ruler.
-const HEADER_HEIGHT: f32 = 26.0;
-
-/// Fixed cell widths of the task table. Explicit widths keep the Name column
-/// readable regardless of the panel width; the table scrolls horizontally.
+/// Fixed cell widths of the task table.
 const ID_WIDTH: f32 = 40.0;
 const NAME_WIDTH: f32 = 190.0;
 const START_WIDTH: f32 = 56.0;
@@ -54,7 +50,9 @@ enum Action {
     Open,
     Save,
     SaveAs,
+    ImportCsv,
     ExportCsv,
+    ExportPdf,
     Undo,
     Redo,
     About,
@@ -74,7 +72,27 @@ enum PendingChoice {
     Cancel,
 }
 
-/// A deferred document mutation collected while drawing the table.
+/// Column used to sort the task table.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SortKey {
+    Name,
+    Start,
+    Duration,
+    Progress,
+}
+
+impl SortKey {
+    const fn label(self) -> &'static str {
+        match self {
+            Self::Name => "Name",
+            Self::Start => "Start",
+            Self::Duration => "Days",
+            Self::Progress => "Progress",
+        }
+    }
+}
+
+/// A deferred document mutation collected while drawing widgets.
 #[derive(Debug, Clone)]
 enum TaskEdit {
     Title(String),
@@ -83,6 +101,20 @@ enum TaskEdit {
     Start(u64, i64),
     Duration(u64, i64),
     Progress(u64, f32),
+    Notes(u64, String),
+    Resource(u64, String),
+    Cost(u64, f64),
+    Milestone(u64, bool),
+    CalendarStart(Option<Date>),
+    SkipWeekends(bool),
+}
+
+/// Active bar drag. The whole drag is one history gesture.
+#[derive(Debug, Clone, Copy)]
+struct DragState {
+    task_id: u64,
+    pointer_x: f32,
+    original_start: i64,
 }
 
 /// The ProjectCraft application state.
@@ -93,8 +125,13 @@ pub struct ProjectApp {
     title_buffer: String,
     name_buffers: BTreeMap<u64, String>,
     dep_buffers: BTreeMap<u64, String>,
+    notes_buffers: BTreeMap<u64, String>,
+    resource_buffers: BTreeMap<u64, String>,
     schedule_error: Option<String>,
     pending: Option<PendingAction>,
+    zoom: Zoom,
+    sort: SortKey,
+    drag: Option<DragState>,
 }
 
 impl ProjectApp {
@@ -120,8 +157,13 @@ impl ProjectApp {
             title_buffer: String::new(),
             name_buffers: BTreeMap::new(),
             dep_buffers: BTreeMap::new(),
+            notes_buffers: BTreeMap::new(),
+            resource_buffers: BTreeMap::new(),
             schedule_error: None,
             pending: None,
+            zoom: Zoom::Day,
+            sort: SortKey::Start,
+            drag: None,
         };
         app.shell.install_theme(&context.egui_ctx);
         app.refresh_buffers();
@@ -136,10 +178,14 @@ impl ProjectApp {
         self.title_buffer = document.title.clone();
         self.name_buffers.clear();
         self.dep_buffers.clear();
+        self.notes_buffers.clear();
+        self.resource_buffers.clear();
         for task in &document.tasks {
             self.name_buffers.insert(task.id, task.name.clone());
             self.dep_buffers
                 .insert(task.id, format_dependencies(&task.dependencies));
+            self.notes_buffers.insert(task.id, task.notes.clone());
+            self.resource_buffers.insert(task.id, task.resource.clone());
         }
     }
 
@@ -200,6 +246,24 @@ impl ProjectApp {
         }
     }
 
+    fn import_csv(&mut self) {
+        let Some(path) = dialogs::open_project("Import tasks from CSV", &["csv"]) else {
+            return;
+        };
+        match import_csv(&path) {
+            Ok(document) => {
+                let count = document.tasks.len();
+                self.host.apply(|current| *current = document);
+                self.selected = None;
+                self.refresh_buffers();
+                self.shell.set_status(format!("Imported {count} tasks"));
+            }
+            Err(error) => {
+                self.shell.notify(Tone::Error, "CSV import failed", error);
+            }
+        }
+    }
+
     fn export_csv(&mut self) {
         let result = match schedule(self.host.document()) {
             Ok(result) => result,
@@ -217,6 +281,30 @@ impl ProjectApp {
             return;
         };
         match write_csv(&path, self.host.document(), &result) {
+            Ok(()) => self
+                .shell
+                .set_status(format!("Exported {}", path.display())),
+            Err(error) => self.shell.notify(Tone::Error, "Export failed", error),
+        }
+    }
+
+    fn export_pdf(&mut self) {
+        let result = match schedule(self.host.document()) {
+            Ok(result) => result,
+            Err(error) => {
+                self.shell.notify(
+                    Tone::Error,
+                    "Export failed",
+                    format!("Fix the plan: {error}"),
+                );
+                return;
+            }
+        };
+        let default_name = format!("{}-gantt.pdf", slugify(&self.host.document().title));
+        let Some(path) = dialogs::save_project("Export Gantt as PDF", &default_name, "pdf") else {
+            return;
+        };
+        match export_pdf(&path, self.host.document(), &result) {
             Ok(()) => self
                 .shell
                 .set_status(format!("Exported {}", path.display())),
@@ -285,6 +373,43 @@ impl ProjectApp {
         }
     }
 
+    fn add_milestone(&mut self) {
+        let after = self.selected;
+        let mut new_id = 0;
+        if self
+            .host
+            .apply(|document| new_id = document.add_milestone(after))
+        {
+            self.selected = Some(new_id);
+            self.refresh_buffers();
+            self.shell.set_status("Milestone added");
+        }
+    }
+
+    fn duplicate_selected(&mut self) {
+        let Some(id) = self.selected else {
+            return;
+        };
+        let mut copy_id = None;
+        if self
+            .host
+            .apply(|document| copy_id = document.duplicate_task(id))
+        {
+            self.selected = copy_id;
+            self.refresh_buffers();
+            self.shell.set_status("Task duplicated");
+        }
+    }
+
+    fn move_selected(&mut self, delta: isize) {
+        let Some(id) = self.selected else {
+            return;
+        };
+        self.host.apply(|document| {
+            document.move_task(id, delta);
+        });
+    }
+
     fn delete_task(&mut self, id: u64) {
         if self.host.apply(|document| {
             document.remove_task(id);
@@ -292,13 +417,12 @@ impl ProjectApp {
             if self.selected == Some(id) {
                 self.selected = None;
             }
-            self.name_buffers.remove(&id);
-            self.dep_buffers.remove(&id);
             self.refresh_buffers();
             self.shell.set_status("Task deleted");
         }
     }
 
+    /// Apply a queued edit to the document through the undo history.
     fn apply_edit(&mut self, edit: TaskEdit) {
         match edit {
             TaskEdit::Title(value) => {
@@ -339,6 +463,47 @@ impl ProjectApp {
                     }
                 });
             }
+            TaskEdit::Notes(id, value) => {
+                self.host.apply(|document| {
+                    if let Some(task) = document.task_mut(id) {
+                        task.notes = value;
+                    }
+                });
+            }
+            TaskEdit::Resource(id, value) => {
+                self.host.apply(|document| {
+                    if let Some(task) = document.task_mut(id) {
+                        task.resource = value;
+                    }
+                });
+            }
+            TaskEdit::Cost(id, value) => {
+                self.host.apply(|document| {
+                    if let Some(task) = document.task_mut(id) {
+                        task.cost = value;
+                    }
+                });
+            }
+            TaskEdit::Milestone(id, value) => {
+                self.host.apply(|document| {
+                    if let Some(task) = document.task_mut(id) {
+                        task.milestone = value;
+                        if value {
+                            task.duration_days = 0;
+                        } else if task.duration_days == 0 {
+                            task.duration_days = 1;
+                        }
+                    }
+                });
+            }
+            TaskEdit::CalendarStart(value) => {
+                self.host
+                    .apply(|document| document.calendar.start_date = value);
+            }
+            TaskEdit::SkipWeekends(value) => {
+                self.host
+                    .apply(|document| document.calendar.skip_weekends = value);
+            }
         }
     }
 
@@ -352,7 +517,9 @@ impl ProjectApp {
             Action::SaveAs => {
                 self.save_as();
             }
+            Action::ImportCsv => self.import_csv(),
             Action::ExportCsv => self.export_csv(),
+            Action::ExportPdf => self.export_pdf(),
             Action::Undo => {
                 if self.host.undo() {
                     self.clamp_selection();
@@ -412,7 +579,9 @@ impl ProjectApp {
                     ("Open...", Action::Open),
                     ("Save", Action::Save),
                     ("Save As...", Action::SaveAs),
+                    ("Import CSV...", Action::ImportCsv),
                     ("Export CSV...", Action::ExportCsv),
+                    ("Export Gantt PDF...", Action::ExportPdf),
                 ] {
                     if ui.button(label).clicked() {
                         action = Some(choice);
@@ -457,13 +626,25 @@ impl ProjectApp {
         });
     }
 
+    /// Tasks cloned and ordered by the selected sort key.
+    fn sorted_tasks(&self) -> Vec<crate::document::Task> {
+        let mut tasks = self.host.document().tasks.clone();
+        match self.sort {
+            SortKey::Name => tasks.sort_by(|a, b| a.name.cmp(&b.name)),
+            SortKey::Start => tasks.sort_by_key(|task| (task.start_day, task.id)),
+            SortKey::Duration => tasks.sort_by_key(|task| (task.duration_days, task.id)),
+            SortKey::Progress => tasks.sort_by(|a, b| a.progress.total_cmp(&b.progress)),
+        }
+        tasks
+    }
+
     fn task_table(
         &mut self,
         ui: &mut egui::Ui,
         edits: &mut Vec<TaskEdit>,
         messages: &mut Vec<String>,
     ) {
-        let tasks = self.host.document().tasks.clone();
+        let tasks = self.sorted_tasks();
         let mut to_delete = Vec::new();
         {
             let name_buffers = &mut self.name_buffers;
@@ -477,14 +658,36 @@ impl ProjectApp {
 
                     ui.horizontal(|ui| {
                         ui.add_sized([ID_WIDTH, CELL_HEIGHT], egui::Label::new("ID"));
-                        ui.add_sized([NAME_WIDTH, CELL_HEIGHT], egui::Label::new("Name"));
-                        ui.add_sized([START_WIDTH, CELL_HEIGHT], egui::Label::new("Start"));
-                        ui.add_sized([DURATION_WIDTH, CELL_HEIGHT], egui::Label::new("Days"));
+                        for (key, width) in [
+                            (SortKey::Name, NAME_WIDTH),
+                            (SortKey::Start, START_WIDTH),
+                            (SortKey::Duration, DURATION_WIDTH),
+                        ] {
+                            let label = if self.sort == key {
+                                format!("{} ▾", key.label())
+                            } else {
+                                key.label().to_owned()
+                            };
+                            if ui
+                                .add_sized([width, CELL_HEIGHT], egui::Button::new(label))
+                                .clicked()
+                            {
+                                self.sort = key;
+                            }
+                        }
                         ui.add_sized(
                             [DEPENDENCIES_WIDTH, CELL_HEIGHT],
                             egui::Label::new("Depends on"),
                         );
-                        ui.add_sized([PROGRESS_WIDTH, CELL_HEIGHT], egui::Label::new("Progress"));
+                        if ui
+                            .add_sized(
+                                [PROGRESS_WIDTH, CELL_HEIGHT],
+                                egui::Button::new(SortKey::Progress.label()),
+                            )
+                            .clicked()
+                        {
+                            self.sort = SortKey::Progress;
+                        }
                         ui.add_sized([DELETE_WIDTH, CELL_HEIGHT], egui::Label::new(""));
                     });
                     ui.separator();
@@ -492,12 +695,16 @@ impl ProjectApp {
                     for task in &tasks {
                         ui.horizontal(|ui| {
                             let is_selected = *selected == Some(task.id);
-                            let id_button =
-                                egui::Button::new(task.id.to_string()).fill(if is_selected {
-                                    theme::ACCENT
-                                } else {
-                                    theme::PANEL
-                                });
+                            let label = if task.milestone {
+                                format!("◆ {}", task.id)
+                            } else {
+                                task.id.to_string()
+                            };
+                            let id_button = egui::Button::new(label).fill(if is_selected {
+                                theme::ACCENT
+                            } else {
+                                theme::PANEL
+                            });
                             if ui.add_sized([ID_WIDTH, CELL_HEIGHT], id_button).clicked() {
                                 *selected = Some(task.id);
                             }
@@ -577,8 +784,10 @@ impl ProjectApp {
                                 },
                             );
 
-                            let delete = egui::Button::new("x");
-                            if ui.add_sized([DELETE_WIDTH, CELL_HEIGHT], delete).clicked() {
+                            if ui
+                                .add_sized([DELETE_WIDTH, CELL_HEIGHT], egui::Button::new("x"))
+                                .clicked()
+                            {
                                 to_delete.push(task.id);
                             }
                         });
@@ -590,24 +799,179 @@ impl ProjectApp {
         }
     }
 
-    fn gantt(&self, ui: &mut egui::Ui, result: &Schedule) {
-        let tasks = &self.host.document().tasks;
+    /// Inspector for the selected task: milestone, notes, resource, cost.
+    fn details_panel(&mut self, ui: &mut egui::Ui, result: &Schedule, edits: &mut Vec<TaskEdit>) {
+        let Some(id) = self.selected else {
+            ui.label(RichText::new("Select a task to edit its details.").color(theme::FAINT));
+            return;
+        };
+        let Some(task) = self.host.document().task(id).cloned() else {
+            return;
+        };
+        let timing = result.task(id).cloned();
+
+        ui.separator();
+        ui.horizontal(|ui| {
+            ui.heading("Task details");
+            if ui.small_button("Duplicate").clicked() {
+                self.duplicate_selected();
+            }
+            if ui.small_button("Move up").clicked() {
+                self.move_selected(-1);
+            }
+            if ui.small_button("Move down").clicked() {
+                self.move_selected(1);
+            }
+        });
+
+        let mut milestone = task.milestone;
+        if ui
+            .checkbox(&mut milestone, "Milestone (zero-duration marker)")
+            .changed()
+        {
+            edits.push(TaskEdit::Milestone(id, milestone));
+        }
+
+        ui.horizontal(|ui| {
+            ui.label("Resource");
+            let buffer = self
+                .resource_buffers
+                .entry(id)
+                .or_insert_with(|| task.resource.clone());
+            let response = ui.add(TextEdit::singleline(buffer).desired_width(180.0));
+            if response.lost_focus() && buffer != &task.resource {
+                edits.push(TaskEdit::Resource(id, buffer.clone()));
+            }
+            ui.label("Cost");
+            let mut cost = task.cost;
+            if ui
+                .add(
+                    DragValue::new(&mut cost)
+                        .range(0.0..=1_000_000.0)
+                        .prefix("¤"),
+                )
+                .changed()
+            {
+                edits.push(TaskEdit::Cost(id, cost));
+            }
+        });
+
+        ui.horizontal(|ui| {
+            ui.label("Notes");
+            let buffer = self
+                .notes_buffers
+                .entry(id)
+                .or_insert_with(|| task.notes.clone());
+            let response = ui.add(
+                TextEdit::singleline(buffer)
+                    .desired_width(420.0)
+                    .hint_text("Optional notes"),
+            );
+            if response.lost_focus() && buffer != &task.notes {
+                edits.push(TaskEdit::Notes(id, buffer.clone()));
+            }
+        });
+
+        if let Some(timing) = timing {
+            let calendar = &self.host.document().calendar;
+            let earliest = calendar.label_for_day(timing.earliest_start);
+            let finish = calendar.label_for_day(timing.earliest_finish);
+            ui.label(
+                RichText::new(format!(
+                    "Earliest {earliest} → {finish}  •  float {} day(s)  •  {}",
+                    timing.total_float,
+                    if timing.is_critical() {
+                        "critical"
+                    } else {
+                        "flexible"
+                    }
+                ))
+                .color(theme::MUTED),
+            );
+        }
+    }
+
+    /// Project-wide calendar settings.
+    fn calendar_panel(&mut self, ui: &mut egui::Ui, edits: &mut Vec<TaskEdit>) {
+        let calendar = self.host.document().calendar.clone();
+        ui.horizontal(|ui| {
+            ui.label("Start date");
+            let mut enabled = calendar.start_date.is_some();
+            if ui.checkbox(&mut enabled, "Real dates").changed() {
+                let date = enabled.then(|| Date::new(2026, 11, 23).expect("valid date"));
+                edits.push(TaskEdit::CalendarStart(date));
+            }
+            if let Some(date) = calendar.start_date {
+                let mut year = date.year;
+                let mut month = date.month as i32;
+                let mut day = date.day as i32;
+                if ui
+                    .add(DragValue::new(&mut year).range(1970..=2100).prefix("Y "))
+                    .changed()
+                    && let Some(valid) = Date::new(year, date.month, date.day)
+                {
+                    edits.push(TaskEdit::CalendarStart(Some(valid)));
+                }
+                if ui
+                    .add(DragValue::new(&mut month).range(1..=12).prefix("M "))
+                    .changed()
+                    && let Some(valid) = Date::new(date.year, month as u32, date.day)
+                {
+                    edits.push(TaskEdit::CalendarStart(Some(valid)));
+                }
+                if ui
+                    .add(DragValue::new(&mut day).range(1..=31).prefix("D "))
+                    .changed()
+                    && let Some(valid) = Date::new(date.year, date.month, day as u32)
+                {
+                    edits.push(TaskEdit::CalendarStart(Some(valid)));
+                }
+            }
+            let mut skip = calendar.skip_weekends;
+            if ui.checkbox(&mut skip, "Skip weekends").changed() {
+                edits.push(TaskEdit::SkipWeekends(skip));
+            }
+        });
+    }
+
+    fn gantt(&mut self, ui: &mut egui::Ui, result: &Schedule) {
+        let tasks = self.host.document().tasks.clone();
         let days = result.project_duration.max(1);
-        let content_width = LABEL_WIDTH + days as f32 * DAY_WIDTH + 24.0;
+        let available_width = ui.available_width();
+        let day_width = self.zoom.day_width(days, available_width);
+        let content_width = LABEL_WIDTH + days as f32 * day_width + 24.0;
         let content_height = HEADER_HEIGHT + tasks.len() as f32 * ROW_HEIGHT + 12.0;
         let font = FontId::new(11.0, FontFamily::Proportional);
         let small_font = FontId::new(9.5, FontFamily::Proportional);
+        let calendar = self.host.document().calendar.clone();
+
+        ui.horizontal(|ui| {
+            ui.label("Zoom");
+            for zoom in Zoom::all() {
+                if ui
+                    .selectable_label(self.zoom == zoom, zoom.label())
+                    .clicked()
+                {
+                    self.zoom = zoom;
+                }
+            }
+            ui.label(
+                RichText::new("Click a bar to select • drag to reschedule").color(theme::FAINT),
+            );
+        });
 
         ScrollArea::both()
             .auto_shrink([false, false])
             .max_height(360.0)
             .show(ui, |ui| {
-                let (rect, _) = ui
-                    .allocate_exact_size(Vec2::new(content_width, content_height), Sense::hover());
+                let (rect, response) = ui.allocate_exact_size(
+                    Vec2::new(content_width, content_height),
+                    Sense::click_and_drag(),
+                );
                 let painter = ui.painter_at(rect);
                 painter.rect_filled(rect, CornerRadius::ZERO, theme::SUNKEN);
 
-                // Alternating row backgrounds.
+                // Alternating row backgrounds and row hit-test rectangles.
                 for row in 0..tasks.len() {
                     if row % 2 == 0 {
                         continue;
@@ -618,12 +982,11 @@ impl ProjectApp {
                     painter.rect_filled(row_rect, CornerRadius::ZERO, theme::PANEL);
                 }
 
-                // Ruler background and day ticks.
                 let header = Rect::from_min_size(rect.min, vec2(content_width, HEADER_HEIGHT));
                 painter.rect_filled(header, CornerRadius::ZERO, theme::RAISED);
-                let step = if days > 40 { 5 } else { 1 };
+                let step = self.zoom.ruler_step(days).max(1);
                 for day in (0..=days).step_by(step) {
-                    let x = rect.min.x + LABEL_WIDTH + day as f32 * DAY_WIDTH;
+                    let x = day_x(day, rect.min.x + LABEL_WIDTH, day_width);
                     painter.line_segment(
                         [pos2(x, rect.min.y), pos2(x, rect.max.y)],
                         Stroke::new(1.0, theme::BORDER),
@@ -631,7 +994,7 @@ impl ProjectApp {
                     painter.text(
                         pos2(x + 3.0, rect.min.y + HEADER_HEIGHT / 2.0),
                         Align2::LEFT_CENTER,
-                        day.to_string(),
+                        calendar.label_for_day(day),
                         small_font.clone(),
                         theme::MUTED,
                     );
@@ -639,51 +1002,152 @@ impl ProjectApp {
                 painter.text(
                     pos2(rect.min.x + 8.0, rect.min.y + HEADER_HEIGHT / 2.0),
                     Align2::LEFT_CENTER,
-                    "Task / day",
+                    "Task / date",
                     small_font,
                     theme::FAINT,
                 );
 
-                // Bars and labels.
+                // Task labels and row selection.
                 for (row, task) in tasks.iter().enumerate() {
                     let center_y =
                         rect.min.y + HEADER_HEIGHT + row as f32 * ROW_HEIGHT + ROW_HEIGHT / 2.0;
                     painter.text(
                         pos2(rect.min.x + 8.0, center_y),
                         Align2::LEFT_CENTER,
-                        task.name.as_str(),
+                        if self.selected == Some(task.id) {
+                            format!("▸ {}", task.name)
+                        } else {
+                            task.name.clone()
+                        },
                         font.clone(),
-                        theme::TEXT,
+                        if result
+                            .task(task.id)
+                            .is_some_and(|timing| timing.is_critical())
+                        {
+                            theme::ACCENT_LIGHT
+                        } else {
+                            theme::TEXT
+                        },
                     );
+                }
+
+                // Dependency arrows, drawn behind the bars.
+                for (row, task) in tasks.iter().enumerate() {
                     let Some(timing) = result.task(task.id) else {
                         continue;
                     };
-                    let left = rect.min.x + LABEL_WIDTH + timing.earliest_start as f32 * DAY_WIDTH;
-                    let right =
-                        rect.min.x + LABEL_WIDTH + timing.earliest_finish as f32 * DAY_WIDTH;
-                    let bar = Rect::from_min_max(
-                        pos2(left, center_y - 7.0),
-                        pos2(right.max(left + 2.0), center_y + 7.0),
+                    let to_y =
+                        rect.min.y + HEADER_HEIGHT + row as f32 * ROW_HEIGHT + ROW_HEIGHT / 2.0;
+                    let to_x = day_x(timing.earliest_start, rect.min.x + LABEL_WIDTH, day_width);
+                    for dependency in &task.dependencies {
+                        let Some(parent_index) =
+                            tasks.iter().position(|item| item.id == *dependency)
+                        else {
+                            continue;
+                        };
+                        let Some(parent) = result.task(*dependency) else {
+                            continue;
+                        };
+                        let from_y = rect.min.y
+                            + HEADER_HEIGHT
+                            + parent_index as f32 * ROW_HEIGHT
+                            + ROW_HEIGHT / 2.0;
+                        let from_x =
+                            day_x(parent.earliest_finish, rect.min.x + LABEL_WIDTH, day_width);
+                        let points = arrow_points((from_x, from_y), (to_x, to_y));
+                        for pair in points.windows(2) {
+                            painter.line_segment(
+                                [pos2(pair[0].0, pair[0].1), pos2(pair[1].0, pair[1].1)],
+                                Stroke::new(1.0, theme::BORDER_STRONG),
+                            );
+                        }
+                        painter.arrow(
+                            pos2(to_x - 5.0, to_y),
+                            vec2(5.0, 0.0),
+                            Stroke::new(1.0, theme::BORDER_STRONG),
+                        );
+                    }
+                }
+
+                // Bars, milestones and drag interaction.
+                for (row, task) in tasks.iter().enumerate() {
+                    let Some(timing) = result.task(task.id) else {
+                        continue;
+                    };
+                    let center_y =
+                        rect.min.y + HEADER_HEIGHT + row as f32 * ROW_HEIGHT + ROW_HEIGHT / 2.0;
+                    let (left, top, right, bottom) = bar_rect(
+                        timing.earliest_start,
+                        timing.earliest_finish,
+                        rect.min.x + LABEL_WIDTH,
+                        center_y,
+                        day_width,
                     );
+                    let bar = Rect::from_min_max(pos2(left, top), pos2(right, bottom));
+
                     let color = if timing.is_critical() {
                         theme::ACCENT
                     } else {
                         theme::INFO
                     };
-                    painter.rect_filled(bar, CornerRadius::same(4), color);
-                    if task.progress > 0.0 {
-                        let width = bar.width() * task.progress.clamp(0.0, 1.0);
-                        let done = Rect::from_min_size(bar.min, vec2(width, bar.height()));
-                        painter.rect_filled(done, CornerRadius::same(4), theme::SUCCESS);
+                    if task.milestone {
+                        let mid = (left + right) / 2.0;
+                        let half = 7.0;
+                        let diamond = vec![
+                            pos2(mid, center_y - half),
+                            pos2(mid + half, center_y),
+                            pos2(mid, center_y + half),
+                            pos2(mid - half, center_y),
+                        ];
+                        painter.add(Shape::convex_polygon(diamond, color, Stroke::NONE));
+                    } else {
+                        painter.rect_filled(bar, CornerRadius::same(4), color);
+                        if task.progress > 0.0 {
+                            let width = bar.width() * task.progress.clamp(0.0, 1.0);
+                            let done = Rect::from_min_size(bar.min, vec2(width, bar.height()));
+                            painter.rect_filled(done, CornerRadius::same(4), theme::SUCCESS);
+                        }
                     }
                     if !timing.is_critical() && timing.total_float > 0 {
                         let slack_end =
-                            rect.min.x + LABEL_WIDTH + timing.latest_finish as f32 * DAY_WIDTH;
+                            day_x(timing.latest_finish, rect.min.x + LABEL_WIDTH, day_width);
                         painter.line_segment(
                             [pos2(right, center_y), pos2(slack_end, center_y)],
                             Stroke::new(2.0, theme::FAINT),
                         );
                     }
+                }
+
+                // Start or continue a reschedule gesture from the bar drag.
+                if let Some(pointer) = response.interact_pointer_pos() {
+                    if response.drag_started() {
+                        let relative_y = pointer.y - rect.min.y;
+                        if let Some(row) = row_at(relative_y)
+                            && let Some(task) = tasks.get(row)
+                        {
+                            self.host.history_mut().begin_gesture();
+                            self.drag = Some(DragState {
+                                task_id: task.id,
+                                pointer_x: pointer.x,
+                                original_start: task.start_day,
+                            });
+                            self.selected = Some(task.id);
+                        }
+                    }
+                    if let Some(drag) = self.drag
+                        && response.dragged()
+                    {
+                        let delta = drag_delta_days(drag.pointer_x, pointer.x, day_width);
+                        if let Some(task) =
+                            self.host.history_mut().current_mut().task_mut(drag.task_id)
+                        {
+                            task.start_day = drag.original_start + delta;
+                        }
+                    }
+                }
+                if response.drag_stopped() && self.drag.take().is_some() {
+                    self.host.history_mut().end_gesture();
+                    self.shell.set_status("Bar rescheduled");
                 }
             });
     }
@@ -696,12 +1160,17 @@ impl ProjectApp {
             ui.horizontal(|ui| {
                 ui.heading("Task plan");
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    if widgets::toolbar_button(ui, "PDF", "Export the Gantt as PDF").clicked() {
+                        self.export_pdf();
+                    }
+                    if widgets::toolbar_button(ui, "CSV", "Export the task table").clicked() {
+                        self.export_csv();
+                    }
+                    if widgets::toolbar_button(ui, "Milestone", "Add a milestone").clicked() {
+                        self.add_milestone();
+                    }
                     if widgets::toolbar_button(ui, "Add task", "Append a new task").clicked() {
                         self.add_task();
-                    }
-                    if widgets::toolbar_button(ui, "Export CSV", "Export the task table").clicked()
-                    {
-                        self.export_csv();
                     }
                 });
             });
@@ -714,22 +1183,33 @@ impl ProjectApp {
                     edits.push(TaskEdit::Title(self.title_buffer.clone()));
                 }
             });
+            self.calendar_panel(ui, &mut edits);
             ui.separator();
 
             match schedule(self.host.document()) {
                 Ok(result) => {
                     self.schedule_error = None;
                     let critical = result.critical_task_ids().len();
+                    let cost = self.host.document().total_cost();
                     ui.label(
                         RichText::new(format!(
-                            "Duration: {} days  •  Critical tasks: {critical}",
+                            "Duration: {} days  •  Critical: {critical}  •  Cost: {cost:.2}",
                             result.project_duration
                         ))
                         .color(theme::MUTED),
                     );
-                    self.task_table(ui, &mut edits, &mut messages);
-                    ui.separator();
-                    self.gantt(ui, &result);
+                    if self.host.document().tasks.is_empty() {
+                        widgets::empty_state(
+                            ui,
+                            "No tasks yet",
+                            "Add a task or a milestone to start planning.",
+                        );
+                    } else {
+                        self.task_table(ui, &mut edits, &mut messages);
+                        self.details_panel(ui, &result, &mut edits);
+                        ui.separator();
+                        self.gantt(ui, &result);
+                    }
                 }
                 Err(error) => {
                     self.schedule_error = Some(error.clone());

@@ -21,8 +21,13 @@ export CARGO_TARGET_DIR=/tmp/cargo-target
 
 ```text
 src/main.rs       CLI, window options and eframe startup
-src/app.rs        UI, menus, actions and project lifecycle
-src/document.rs   application document model
+src/app.rs        UI, interactive Gantt and project lifecycle
+src/document.rs   task/document model and field parsing
+src/schedule.rs   CPM forward/backward passes and validation
+src/calendar.rs   optional civil dates and weekend skipping
+src/gantt.rs      zoom, hit-testing and arrow geometry
+src/csv.rs        CSV import/export with quoting
+src/pdf.rs        dependency-free vector Gantt export
 ```
 
 CraftKit provides:
