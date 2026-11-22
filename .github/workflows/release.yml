@@ -103,7 +103,7 @@ jobs:
         if: runner.os == 'Windows'
         shell: pwsh
         run: |
-          $name = "projectcraft-${{ steps.version.outputs.version }}-${{ matrix.token }}"
+          $name = "projectcraft-${{ steps.version.outputs.version }}-${{ matrix.token }}-portable"
           New-Item -ItemType Directory -Force -Path "dist/$name" | Out-Null
           Copy-Item "target/${{ matrix.target }}/release/${{ matrix.binary }}" "dist/$name/"
           Copy-Item README.md, LICENSE-MIT, LICENSE-APACHE, AGENTS.md, THIRD_PARTY.md, LAUNCHER.md "dist/$name/"
@@ -201,7 +201,7 @@ jobs:
 
             ### Downloads
             - **Linux x86_64 (portable):** `projectcraft-<version>-linux-x86_64.tar.gz`
-            - **Windows x64 (portable):** `projectcraft-<version>-windows-x64.zip`
+            - **Windows x64 (portable):** `projectcraft-<version>-windows-x64-portable.zip`
             - **macOS Apple silicon (portable):** `projectcraft-<version>-macos-aarch64.tar.gz`
             - **macOS Intel (portable):** `projectcraft-<version>-macos-x86_64.tar.gz`
 

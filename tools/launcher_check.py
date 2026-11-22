@@ -218,6 +218,9 @@ def validate_release(app_dir: Path, data: dict, release_dir: Path) -> bool:
         elif match.group("id") != data["id"]:
             error(f"asset id does not match manifest id: {name}")
             ok = False
+        elif name.endswith(".zip") and not name.endswith("-portable.zip"):
+            error(f"Windows zip must end in -portable.zip: {name}")
+            ok = False
 
     if not (app_dir / "craft-app.json").is_file():
         error("craft-app.json must be committed at the repository root")

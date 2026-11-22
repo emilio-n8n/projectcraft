@@ -56,7 +56,7 @@ Each release should attach:
 
 - archives named `<id>-<version>-<os>-<arch>.<ext>`:
   - `projectcraft-<version>-linux-x86_64.tar.gz` or `.AppImage` / `.deb` / `.rpm`
-  - `projectcraft-<version>-windows-x64.zip` or `.msi`
+  - `projectcraft-<version>-windows-x64-portable.zip` or `.msi`
   - `projectcraft-<version>-macos-aarch64.dmg` / `macos-x86_64.dmg`
 - `craft-app.json`
 - `projectcraft-128.png`
