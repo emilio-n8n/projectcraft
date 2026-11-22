@@ -7,8 +7,8 @@ use craftkit_io::DocumentHost;
 use craftkit_ui::cli::CliOptions;
 use craftkit_ui::eframe::{self, egui};
 use craftkit_ui::egui::{
-    Align, Align2, CornerRadius, DragValue, FontFamily, FontId, Grid, Layout, Rect, RichText,
-    ScrollArea, Sense, Stroke, TextEdit, Vec2, pos2, vec2,
+    Align, Align2, CornerRadius, DragValue, FontFamily, FontId, Layout, Rect, RichText, ScrollArea,
+    Sense, Stroke, TextEdit, Vec2, pos2, vec2,
 };
 use craftkit_ui::{AppIdentity, AppShell, Tone, dialogs, theme, widgets};
 
@@ -28,6 +28,25 @@ const LABEL_WIDTH: f32 = 175.0;
 const ROW_HEIGHT: f32 = 22.0;
 /// Height of the day ruler.
 const HEADER_HEIGHT: f32 = 26.0;
+
+/// Fixed cell widths of the task table. Explicit widths keep the Name column
+/// readable regardless of the panel width; the table scrolls horizontally.
+const ID_WIDTH: f32 = 40.0;
+const NAME_WIDTH: f32 = 190.0;
+const START_WIDTH: f32 = 56.0;
+const DURATION_WIDTH: f32 = 56.0;
+const DEPENDENCIES_WIDTH: f32 = 86.0;
+const PROGRESS_WIDTH: f32 = 106.0;
+const DELETE_WIDTH: f32 = 26.0;
+const CELL_HEIGHT: f32 = 22.0;
+const TABLE_WIDTH: f32 = ID_WIDTH
+    + NAME_WIDTH
+    + START_WIDTH
+    + DURATION_WIDTH
+    + DEPENDENCIES_WIDTH
+    + PROGRESS_WIDTH
+    + DELETE_WIDTH
+    + 6.0 * 8.0;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Action {
@@ -451,89 +470,118 @@ impl ProjectApp {
             let dep_buffers = &mut self.dep_buffers;
             let selected = &mut self.selected;
 
-            Grid::new("task-table")
-                .striped(true)
-                .num_columns(7)
+            ScrollArea::horizontal()
+                .auto_shrink([false, true])
                 .show(ui, |ui| {
-                    ui.label("ID");
-                    ui.label("Name");
-                    ui.label("Start");
-                    ui.label("Days");
-                    ui.label("Depends on");
-                    ui.label("Progress");
-                    ui.label("");
-                    ui.end_row();
+                    ui.set_min_width(TABLE_WIDTH);
+
+                    ui.horizontal(|ui| {
+                        ui.add_sized([ID_WIDTH, CELL_HEIGHT], egui::Label::new("ID"));
+                        ui.add_sized([NAME_WIDTH, CELL_HEIGHT], egui::Label::new("Name"));
+                        ui.add_sized([START_WIDTH, CELL_HEIGHT], egui::Label::new("Start"));
+                        ui.add_sized([DURATION_WIDTH, CELL_HEIGHT], egui::Label::new("Days"));
+                        ui.add_sized(
+                            [DEPENDENCIES_WIDTH, CELL_HEIGHT],
+                            egui::Label::new("Depends on"),
+                        );
+                        ui.add_sized([PROGRESS_WIDTH, CELL_HEIGHT], egui::Label::new("Progress"));
+                        ui.add_sized([DELETE_WIDTH, CELL_HEIGHT], egui::Label::new(""));
+                    });
+                    ui.separator();
 
                     for task in &tasks {
-                        if ui
-                            .selectable_label(*selected == Some(task.id), task.id.to_string())
-                            .clicked()
-                        {
-                            *selected = Some(task.id);
-                        }
-
-                        let name = name_buffers
-                            .entry(task.id)
-                            .or_insert_with(|| task.name.clone());
-                        let response = ui.add(TextEdit::singleline(name).desired_width(170.0));
-                        if response.lost_focus() && name != &task.name {
-                            edits.push(TaskEdit::Name(task.id, name.clone()));
-                        }
-
-                        let mut start = task.start_day;
-                        if ui.add(DragValue::new(&mut start).speed(1.0)).changed() {
-                            edits.push(TaskEdit::Start(task.id, start));
-                        }
-
-                        let mut duration = task.duration_days;
-                        if ui
-                            .add(DragValue::new(&mut duration).range(0..=3650))
-                            .changed()
-                        {
-                            edits.push(TaskEdit::Duration(task.id, duration));
-                        }
-
-                        let dependencies = dep_buffers
-                            .entry(task.id)
-                            .or_insert_with(|| format_dependencies(&task.dependencies));
-                        let response = ui.add(
-                            TextEdit::singleline(dependencies)
-                                .desired_width(90.0)
-                                .hint_text("1,2"),
-                        );
-                        if response.lost_focus() {
-                            let raw = dependencies.clone();
-                            match parse_dependencies(&raw) {
-                                Ok(ids) => {
-                                    if ids != task.dependencies {
-                                        edits.push(TaskEdit::Dependencies(task.id, ids));
-                                    }
-                                }
-                                Err(error) => {
-                                    messages.push(error);
-                                    *dependencies = format_dependencies(&task.dependencies);
-                                }
-                            }
-                        }
-
-                        let mut percent = (task.progress.clamp(0.0, 1.0) * 100.0).round() as i32;
                         ui.horizontal(|ui| {
+                            let is_selected = *selected == Some(task.id);
+                            let id_button =
+                                egui::Button::new(task.id.to_string()).fill(if is_selected {
+                                    theme::ACCENT
+                                } else {
+                                    theme::PANEL
+                                });
+                            if ui.add_sized([ID_WIDTH, CELL_HEIGHT], id_button).clicked() {
+                                *selected = Some(task.id);
+                            }
+
+                            let name = name_buffers
+                                .entry(task.id)
+                                .or_insert_with(|| task.name.clone());
+                            let response =
+                                ui.add_sized([NAME_WIDTH, CELL_HEIGHT], TextEdit::singleline(name));
+                            if response.lost_focus() && name != &task.name {
+                                edits.push(TaskEdit::Name(task.id, name.clone()));
+                            }
+
+                            let mut start = task.start_day;
                             if ui
-                                .add(DragValue::new(&mut percent).range(0..=100).suffix("%"))
+                                .add_sized([START_WIDTH, CELL_HEIGHT], DragValue::new(&mut start))
                                 .changed()
                             {
-                                edits.push(TaskEdit::Progress(task.id, percent as f32 / 100.0));
+                                edits.push(TaskEdit::Start(task.id, start));
                             }
-                            ui.add(
-                                egui::ProgressBar::new(task.progress.clamp(0.0, 1.0))
-                                    .desired_width(50.0),
-                            );
-                        });
 
-                        if ui.small_button("x").clicked() {
-                            to_delete.push(task.id);
-                        }
-                        ui.end_row();
+                            let mut duration = task.duration_days;
+                            if ui
+                                .add_sized(
+                                    [DURATION_WIDTH, CELL_HEIGHT],
+                                    DragValue::new(&mut duration).range(0..=3650),
+                                )
+                                .changed()
+                            {
+                                edits.push(TaskEdit::Duration(task.id, duration));
+                            }
+
+                            let dependencies = dep_buffers
+                                .entry(task.id)
+                                .or_insert_with(|| format_dependencies(&task.dependencies));
+                            let response = ui.add_sized(
+                                [DEPENDENCIES_WIDTH, CELL_HEIGHT],
+                                TextEdit::singleline(dependencies).hint_text("1,2"),
+                            );
+                            if response.lost_focus() {
+                                let raw = dependencies.clone();
+                                match parse_dependencies(&raw) {
+                                    Ok(ids) => {
+                                        if ids != task.dependencies {
+                                            edits.push(TaskEdit::Dependencies(task.id, ids));
+                                        }
+                                    }
+                                    Err(error) => {
+                                        messages.push(error);
+                                        *dependencies = format_dependencies(&task.dependencies);
+                                    }
+                                }
+                            }
+
+                            let mut percent =
+                                (task.progress.clamp(0.0, 1.0) * 100.0).round() as i32;
+                            ui.allocate_ui_with_layout(
+                                vec2(PROGRESS_WIDTH, CELL_HEIGHT),
+                                Layout::left_to_right(Align::Center),
+                                |ui| {
+                                    if ui
+                                        .add_sized(
+                                            [72.0, CELL_HEIGHT],
+                                            DragValue::new(&mut percent).range(0..=100).suffix("%"),
+                                        )
+                                        .changed()
+                                    {
+                                        edits.push(TaskEdit::Progress(
+                                            task.id,
+                                            percent as f32 / 100.0,
+                                        ));
+                                    }
+                                    ui.add_sized(
+                                        [30.0, 12.0],
+                                        egui::ProgressBar::new(task.progress.clamp(0.0, 1.0)),
+                                    );
+                                },
+                            );
+
+                            let delete = egui::Button::new("x");
+                            if ui.add_sized([DELETE_WIDTH, CELL_HEIGHT], delete).clicked() {
+                                to_delete.push(task.id);
+                            }
+                        });
                     }
                 });
         }
