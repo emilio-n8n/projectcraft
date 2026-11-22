@@ -1,0 +1,15 @@
+{
+  "schema": 1,
+  "id": "projectcraft",
+  "name": "ProjectCraft",
+  "tagline": "Project planning with dependencies, CPM and Gantt",
+  "repo": "emilio-n8n/projectcraft",
+  "publisher": "emilio-n8n",
+  "upstream": null,
+  "bundle_id": "io.github.emilion8n.projectcraft",
+  "msi_publisher": "emilio-n8n",
+  "apple_team": null,
+  "website": "https://github.com/emilio-n8n/projectcraft",
+  "color": "#4f8cff",
+  "icon": "projectcraft-128.png"
+}

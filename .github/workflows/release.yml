@@ -30,18 +30,22 @@ jobs:
         include:
           - os: ubuntu-22.04
             target: x86_64-unknown-linux-gnu
+            token: linux-x86_64
             archive: tar.gz
             binary: projectcraft
           - os: windows-latest
             target: x86_64-pc-windows-msvc
+            token: windows-x64
             archive: zip
             binary: projectcraft.exe
           - os: macos-latest
             target: aarch64-apple-darwin
+            token: macos-aarch64
             archive: tar.gz
             binary: projectcraft
           - os: macos-latest
             target: x86_64-apple-darwin
+            token: macos-x86_64
             archive: tar.gz
             binary: projectcraft
 
@@ -88,10 +92,10 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          name="projectcraft-${{ matrix.target }}"
+          name="projectcraft-${{ steps.version.outputs.version }}-${{ matrix.token }}"
           mkdir -p "dist/$name"
           cp "target/${{ matrix.target }}/release/${{ matrix.binary }}" "dist/$name/"
-          cp README.md LICENSE-MIT LICENSE-APACHE AGENTS.md THIRD_PARTY.md "dist/$name/"
+          cp README.md LICENSE-MIT LICENSE-APACHE AGENTS.md THIRD_PARTY.md LAUNCHER.md "dist/$name/"
           chmod +x "dist/$name/${{ matrix.binary }}"
           tar -C dist -czf "dist/$name.tar.gz" "$name"
 
@@ -99,10 +103,10 @@ jobs:
         if: runner.os == 'Windows'
         shell: pwsh
         run: |
-          $name = "projectcraft-${{ matrix.target }}"
+          $name = "projectcraft-${{ steps.version.outputs.version }}-${{ matrix.token }}"
           New-Item -ItemType Directory -Force -Path "dist/$name" | Out-Null
           Copy-Item "target/${{ matrix.target }}/release/${{ matrix.binary }}" "dist/$name/"
-          Copy-Item README.md, LICENSE-MIT, LICENSE-APACHE, AGENTS.md, THIRD_PARTY.md "dist/$name/"
+          Copy-Item README.md, LICENSE-MIT, LICENSE-APACHE, AGENTS.md, THIRD_PARTY.md, LAUNCHER.md "dist/$name/"
           Compress-Archive -Path "dist/$name" -DestinationPath "dist/$name.zip" -Force
 
       - name: Upload platform archive
@@ -113,23 +117,45 @@ jobs:
           if-no-files-found: error
           retention-days: 7
 
-  checksums:
-    name: Generate SHA256SUMS
-    needs: build
+  metadata:
+    name: Launcher metadata
     runs-on: ubuntu-latest
     steps:
+      - uses: actions/checkout@v4
+      - name: Stage manifest and icon
+        run: |
+          mkdir -p dist
+          cp craft-app.json dist/craft-app.json
+          cp "assets/projectcraft-128.png" "dist/projectcraft-128.png"
+          python3 tools/launcher_check.py .
+      - uses: actions/upload-artifact@v4
+        with:
+          name: projectcraft-metadata
+          path: dist/*
+          if-no-files-found: error
+          retention-days: 7
+
+  checksums:
+    name: Generate SHA256SUMS
+    needs: [build, metadata]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
       - uses: actions/download-artifact@v4
         with:
           path: dist
           merge-multiple: true
 
-      - name: Compute checksums
+      - name: Compute checksums and validate
         working-directory: dist
         run: |
           set -euo pipefail
           ls -lh
-          sha256sum ./*.tar.gz ./*.zip > SHA256SUMS.txt
+          find . -maxdepth 1 -type f ! -name SHA256SUMS.txt -printf '%f\n' \
+            | sort | xargs sha256sum > SHA256SUMS.txt
           cat SHA256SUMS.txt
+          cd ..
+          python3 tools/launcher_check.py . --release-dir dist
 
       - uses: actions/upload-artifact@v4
         with:
@@ -174,10 +200,14 @@ jobs:
             Project planning with dependencies, CPM and Gantt
 
             ### Downloads
-            - **Linux x86_64:** `projectcraft-x86_64-unknown-linux-gnu.tar.gz`
-            - **Windows x86_64:** `projectcraft-x86_64-pc-windows-msvc.zip`
-            - **macOS Apple silicon:** `projectcraft-aarch64-apple-darwin.tar.gz`
-            - **macOS Intel:** `projectcraft-x86_64-apple-darwin.tar.gz`
+            - **Linux x86_64 (portable):** `projectcraft-<version>-linux-x86_64.tar.gz`
+            - **Windows x64 (portable):** `projectcraft-<version>-windows-x64.zip`
+            - **macOS Apple silicon (portable):** `projectcraft-<version>-macos-aarch64.tar.gz`
+            - **macOS Intel (portable):** `projectcraft-<version>-macos-x86_64.tar.gz`
+
+            `craft-app.json` and the application icon are attached for the
+            ArtCraft Launcher. Signed MSI, DMG and AppImage packages will follow
+            when the signing and packaging pipeline is available.
 
             ### Verify your download
             ```bash
@@ -188,6 +218,8 @@ jobs:
           files: |
             dist/*.tar.gz
             dist/*.zip
+            dist/craft-app.json
+            dist/projectcraft-128.png
             dist/SHA256SUMS.txt
           fail_on_unmatched_files: true
         env:
