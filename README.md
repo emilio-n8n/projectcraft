@@ -12,9 +12,15 @@ desktop foundation.
 ## Features
 
 - Native Rust desktop UI (egui/eframe), no web runtime.
-- Versioned JSON project files with atomic saves.
+- Editable task table: name, start day, duration, dependencies (`1,2`) and
+  progress. Add and delete tasks; deleting one repairs the dependency graph.
+- Critical Path Method in whole days: earliest/latest start and finish, total
+  float and critical-path detection with clear cycle diagnostics.
+- Gantt canvas drawn with egui's `Painter`: day ruler, per-task bars, progress
+  overlay, slack markers and colour-coded critical tasks.
+- CSV export of authored fields plus computed CPM dates, with proper quoting.
+- Versioned JSON project files with atomic saves and schema validation.
 - Bounded undo/redo through the shared document history.
-- Background jobs with progress and cooperative cancellation.
 - Recent files and persisted preferences.
 - Offline-first: no account, no telemetry, no network required.
 
@@ -46,9 +52,10 @@ Linux windowing development packages are installed by the CI workflow.
 
 ```text
 src/main.rs       CLI and window startup
-src/app.rs        UI, menus and lifecycle
-src/document.rs   application document model
-src/...           domain modules
+src/app.rs        UI, menus and project lifecycle
+src/document.rs   task/document model and field parsing
+src/schedule.rs   CPM forward/backward passes and validation
+src/csv.rs        CSV export with quoting
 ```
 
 The application depends on pinned CraftKit crates from Git. Keep the tag in
@@ -63,12 +70,27 @@ Projects are JSON envelopes:
   "format": "projectcraft",
   "schema_version": 1,
   "app_version": "0.1.0",
-  "document": { }
+  "document": {
+    "title": "Sample project",
+    "tasks": [
+      {
+        "id": 1,
+        "name": "Requirements",
+        "start_day": 0,
+        "duration_days": 2,
+        "dependencies": [],
+        "progress": 1.0
+      }
+    ],
+    "next_id": 2
+  }
 }
 ```
 
-The application owns the `document` schema and its migrations. A newer
-`schema_version` is rejected instead of being silently misread.
+Days are signed integers (no calendar dates), `start_day` is a release
+constraint and durations are whole days. The application owns the `document`
+schema and its migrations. A newer `schema_version` is rejected instead of
+being silently misread.
 
 ## Licence
 

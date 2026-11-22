@@ -7,7 +7,10 @@ All notable changes to ProjectCraft are documented here.
 ### Added
 
 - Initial CraftKit-based application shell.
-- Versioned project files with atomic save.
-- Undo/redo through the shared document history.
-- Background jobs with progress and cancellation.
-- Application-specific document model and UI.
+- Task document model with a five-task sample project.
+- Critical Path Method scheduler in whole days: earliest/latest dates, total
+  float, critical path and explicit cycle diagnostics.
+- Editable task table with dependencies, progress and add/delete actions.
+- Gantt canvas with day ruler, critical-path colouring and slack markers.
+- CSV export of authored fields and computed CPM dates.
+- Versioned project files with atomic save and bounded undo/redo.

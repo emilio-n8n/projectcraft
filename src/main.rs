@@ -3,7 +3,9 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod app;
+mod csv;
 mod document;
+mod schedule;
 
 use craftkit_ui::cli::{self, CliAction};
 use craftkit_ui::{WindowOptions, run_native};
@@ -23,7 +25,7 @@ fn main() -> craftkit_ui::eframe::Result<()> {
                 "{}",
                 cli::help_text(
                     "projectcraft",
-                    "CraftKit demo — notes application and reference implementation"
+                    "ProjectCraft — task planning with dependencies, CPM and Gantt"
                 )
             );
             return Ok(());
@@ -36,7 +38,7 @@ fn main() -> craftkit_ui::eframe::Result<()> {
     };
 
     run_native(WindowOptions::new("ProjectCraft"), move |context| {
-        let app = app::DemoApp::new(context, options);
+        let app = app::ProjectApp::new(context, options);
         Ok(Box::new(app) as Box<dyn craftkit_ui::eframe::App>)
     })
 }
