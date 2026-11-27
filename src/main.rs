@@ -28,7 +28,7 @@ fn main() -> craftkit_ui::eframe::Result<()> {
                 "{}",
                 cli::help_text(
                     "projectcraft",
-                    "ProjectCraft — task planning with dependencies, CPM and Gantt"
+                    "ProjectCraft - task planning with dependencies, CPM and Gantt"
                 )
             );
             return Ok(());

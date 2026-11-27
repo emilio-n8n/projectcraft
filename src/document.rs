@@ -4,6 +4,8 @@
 //! is stored in plain integer days. Newer, optional presentation fields use
 //! `#[serde(default)]` so projects written by v0.1.0 still load under schema 1.
 
+use std::collections::{HashMap, HashSet};
+
 use serde::{Deserialize, Serialize};
 
 use crate::calendar::Calendar;
@@ -137,8 +139,8 @@ impl Document {
 
     /// Append a new empty task and return its identifier.
     pub fn add_task(&mut self) -> u64 {
-        let id = self.next_id;
-        self.next_id = self.next_id.saturating_add(1);
+        let id = self.next_unused_id();
+        self.next_id = id.wrapping_add(1);
         self.tasks.push(Task {
             id,
             name: format!("Task {id}"),
@@ -152,6 +154,14 @@ impl Document {
             cost: 0.0,
         });
         id
+    }
+
+    fn next_unused_id(&self) -> u64 {
+        let mut candidate = self.next_id;
+        while self.task(candidate).is_some() {
+            candidate = candidate.wrapping_add(1);
+        }
+        candidate
     }
 
     /// Append a zero-duration milestone that depends on `after`, if given.
@@ -230,7 +240,7 @@ impl Document {
 ///
 /// # Errors
 ///
-/// Returns a message naming the first token that is not a positive integer.
+/// Returns a message naming the first token that is not an unsigned integer.
 pub fn parse_dependencies(input: &str) -> Result<Vec<u64>, String> {
     let mut ids: Vec<u64> = Vec::new();
     for token in input.split([',', ';', ' ', '\t']) {
@@ -255,6 +265,71 @@ pub fn format_dependencies(ids: &[u64]) -> String {
         .map(u64::to_string)
         .collect::<Vec<_>>()
         .join(", ")
+}
+
+/// Validate a dependency edit before it is committed.
+///
+/// Besides missing and self references, this rejects an edge that would close a
+/// cycle through the existing graph. The rest of the document is left untouched.
+///
+/// # Errors
+///
+/// Returns a message naming the task and the invalid dependency.
+pub fn validate_dependency_change(
+    document: &Document,
+    task_id: u64,
+    dependencies: &[u64],
+) -> Result<(), String> {
+    let Some(task) = document.task(task_id) else {
+        return Err(format!("Task {task_id} no longer exists"));
+    };
+    let mut unique = HashSet::new();
+    for &dependency in dependencies {
+        if dependency == task_id {
+            return Err(format!("Task '{}' cannot depend on itself", task.name));
+        }
+        if document.task(dependency).is_none() {
+            return Err(format!(
+                "Task '{}' depends on unknown task {dependency}",
+                task.name
+            ));
+        }
+        unique.insert(dependency);
+    }
+
+    let mut successors: HashMap<u64, Vec<u64>> = document
+        .tasks
+        .iter()
+        .map(|item| (item.id, Vec::new()))
+        .collect();
+    for item in &document.tasks {
+        for &dependency in &item.dependencies {
+            if let Some(children) = successors.get_mut(&dependency) {
+                children.push(item.id);
+            }
+        }
+    }
+
+    // The proposed edge is dependency -> task. It closes a cycle exactly when
+    // the existing graph already has a path from task to that dependency.
+    let mut pending = vec![task_id];
+    let mut visited = HashSet::new();
+    while let Some(id) = pending.pop() {
+        if visited.insert(id)
+            && let Some(children) = successors.get(&id)
+        {
+            for &child in children {
+                if unique.contains(&child) {
+                    return Err(format!(
+                        "Task '{}': this dependency would create a cycle",
+                        task.name
+                    ));
+                }
+                pending.push(child);
+            }
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -329,6 +404,40 @@ mod tests {
     }
 
     #[test]
+    fn adding_a_task_never_reuses_an_existing_identifier() {
+        let mut document = Document {
+            next_id: u64::MAX,
+            ..Document::default()
+        };
+        let first = document.add_task();
+        assert_eq!(first, u64::MAX);
+        let second = document.add_task();
+        assert_ne!(second, first);
+        assert!(document.task(second).is_some());
+    }
+
+    #[test]
+    fn dependency_edits_reject_missing_self_and_cyclic_references() {
+        let document = Document::sample();
+        assert!(
+            validate_dependency_change(&document, 1, &[99])
+                .expect_err("missing")
+                .contains("unknown task 99")
+        );
+        assert!(
+            validate_dependency_change(&document, 1, &[1])
+                .expect_err("self")
+                .contains("itself")
+        );
+        assert!(
+            validate_dependency_change(&document, 1, &[3])
+                .expect_err("cycle")
+                .contains("cycle")
+        );
+        assert!(validate_dependency_change(&document, 5, &[3]).is_ok());
+    }
+
+    #[test]
     fn dependency_field_round_trip() {
         assert_eq!(
             parse_dependencies("1, 3; 2  3").expect("parse"),
@@ -364,6 +473,29 @@ mod tests {
         assert_eq!(host.document().tasks[1].name, original);
         assert!(host.redo());
         assert_eq!(host.document().tasks[1].name, "Detailed design");
+    }
+
+    #[test]
+    fn numeric_value_gesture_is_one_undo_step() {
+        let mut host =
+            craftkit_io::DocumentHost::new(Document::sample(), "projectcraft", 1, "0.1.0");
+        let original = host.document().task(2).expect("task").duration_days;
+
+        host.history_mut().begin_gesture();
+        for duration in [4_i64, 5, 6] {
+            if let Some(task) = host.history_mut().current_mut().task_mut(2) {
+                task.duration_days = duration;
+            }
+        }
+        host.history_mut().end_gesture();
+
+        assert_eq!(host.history().undo_depth(), 1);
+        assert_eq!(host.document().task(2).expect("task").duration_days, 6);
+        assert!(host.undo());
+        assert_eq!(
+            host.document().task(2).expect("task").duration_days,
+            original
+        );
     }
 
     #[test]

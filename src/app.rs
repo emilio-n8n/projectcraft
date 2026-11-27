@@ -14,10 +14,12 @@ use craftkit_ui::{AppIdentity, AppShell, Tone, dialogs, theme, widgets};
 
 use crate::calendar::Date;
 use crate::csv::{export_csv as write_csv, import_csv};
-use crate::document::{Document, format_dependencies, parse_dependencies};
+use crate::document::{
+    Document, format_dependencies, parse_dependencies, validate_dependency_change,
+};
 use crate::gantt::{
     HEADER_HEIGHT, LABEL_WIDTH, ROW_HEIGHT, Zoom, arrow_points, bar_rect, day_x, drag_delta_days,
-    row_at,
+    drag_target_start,
 };
 use crate::pdf::export_pdf;
 use crate::schedule::{Schedule, schedule};
@@ -55,6 +57,11 @@ enum Action {
     ExportPdf,
     Undo,
     Redo,
+    AddTask,
+    AddMilestone,
+    DuplicateSelected,
+    MoveUp,
+    MoveDown,
     About,
     Settings,
 }
@@ -63,6 +70,7 @@ enum Action {
 enum PendingAction {
     New,
     Open(PathBuf),
+    Exit,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -98,12 +106,8 @@ enum TaskEdit {
     Title(String),
     Name(u64, String),
     Dependencies(u64, Vec<u64>),
-    Start(u64, i64),
-    Duration(u64, i64),
-    Progress(u64, f32),
     Notes(u64, String),
     Resource(u64, String),
-    Cost(u64, f64),
     Milestone(u64, bool),
     CalendarStart(Option<Date>),
     SkipWeekends(bool),
@@ -114,7 +118,9 @@ enum TaskEdit {
 struct DragState {
     task_id: u64,
     pointer_x: f32,
-    original_start: i64,
+    day_width: f32,
+    original_earliest_start: i64,
+    original_release: i64,
 }
 
 /// The ProjectCraft application state.
@@ -132,6 +138,8 @@ pub struct ProjectApp {
     zoom: Zoom,
     sort: SortKey,
     drag: Option<DragState>,
+    value_gesture: bool,
+    allow_close_once: bool,
 }
 
 impl ProjectApp {
@@ -164,6 +172,8 @@ impl ProjectApp {
             zoom: Zoom::Day,
             sort: SortKey::Start,
             drag: None,
+            value_gesture: false,
+            allow_close_once: false,
         };
         app.shell.install_theme(&context.egui_ctx);
         app.refresh_buffers();
@@ -189,7 +199,28 @@ impl ProjectApp {
         }
     }
 
+    fn finish_drag(&mut self) {
+        let Some(drag) = self.drag.take() else {
+            return;
+        };
+        self.host.history_mut().end_gesture();
+        if self
+            .host
+            .document()
+            .task(drag.task_id)
+            .is_some_and(|task| task.start_day != drag.original_release)
+        {
+            self.shell.set_status("Bar rescheduled");
+        }
+    }
+
+    fn finish_value_gesture(&mut self) {
+        finish_value_gesture(&mut self.host, &mut self.value_gesture);
+    }
+
     fn load_path(&mut self, path: PathBuf) {
+        self.finish_drag();
+        self.finish_value_gesture();
         match DocumentHost::from_file(path.clone(), FORMAT, SCHEMA_VERSION, APP_VERSION) {
             Ok(host) => {
                 self.host = host;
@@ -205,6 +236,8 @@ impl ProjectApp {
     }
 
     fn new_document(&mut self) {
+        self.finish_drag();
+        self.finish_value_gesture();
         self.host.reset(Document::default());
         self.selected = None;
         self.refresh_buffers();
@@ -212,6 +245,8 @@ impl ProjectApp {
     }
 
     fn save(&mut self) -> bool {
+        self.finish_drag();
+        self.finish_value_gesture();
         if self.host.path().is_none() {
             return self.save_as();
         }
@@ -229,6 +264,8 @@ impl ProjectApp {
     }
 
     fn save_as(&mut self) -> bool {
+        self.finish_drag();
+        self.finish_value_gesture();
         let default_name = format!("{}.json", slugify(&self.host.document().title));
         let Some(path) = dialogs::save_project("Save project", &default_name, "json") else {
             return false;
@@ -253,10 +290,13 @@ impl ProjectApp {
         match import_csv(&path) {
             Ok(document) => {
                 let count = document.tasks.len();
-                self.host.apply(|current| *current = document);
+                self.finish_drag();
+                self.finish_value_gesture();
+                replace_with_import(&mut self.host, document);
                 self.selected = None;
                 self.refresh_buffers();
-                self.shell.set_status(format!("Imported {count} tasks"));
+                self.shell
+                    .set_status(format!("Imported {count} tasks as a new unsaved project"));
             }
             Err(error) => {
                 self.shell.notify(Tone::Error, "CSV import failed", error);
@@ -331,23 +371,27 @@ impl ProjectApp {
         }
     }
 
-    fn perform(&mut self, action: PendingAction) {
+    fn perform(&mut self, action: PendingAction, ctx: &egui::Context) {
         match action {
             PendingAction::New => self.new_document(),
             PendingAction::Open(path) => self.load_path(path),
+            PendingAction::Exit => {
+                self.allow_close_once = true;
+                ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+            }
         }
     }
 
-    fn resolve_pending(&mut self, choice: PendingChoice) {
+    fn resolve_pending(&mut self, choice: PendingChoice, ctx: &egui::Context) {
         let Some(action) = self.pending.take() else {
             return;
         };
         match choice {
             PendingChoice::Cancel => {}
-            PendingChoice::Discard => self.perform(action),
+            PendingChoice::Discard => self.perform(action, ctx),
             PendingChoice::Save => {
                 if self.save() {
-                    self.perform(action);
+                    self.perform(action, ctx);
                 } else {
                     self.pending = Some(action);
                 }
@@ -365,6 +409,7 @@ impl ProjectApp {
     }
 
     fn add_task(&mut self) {
+        self.finish_drag();
         let mut new_id = 0;
         if self.host.apply(|document| new_id = document.add_task()) {
             self.selected = Some(new_id);
@@ -374,6 +419,7 @@ impl ProjectApp {
     }
 
     fn add_milestone(&mut self) {
+        self.finish_drag();
         let after = self.selected;
         let mut new_id = 0;
         if self
@@ -387,6 +433,7 @@ impl ProjectApp {
     }
 
     fn duplicate_selected(&mut self) {
+        self.finish_drag();
         let Some(id) = self.selected else {
             return;
         };
@@ -411,6 +458,7 @@ impl ProjectApp {
     }
 
     fn delete_task(&mut self, id: u64) {
+        self.finish_drag();
         if self.host.apply(|document| {
             document.remove_task(id);
         }) {
@@ -424,6 +472,8 @@ impl ProjectApp {
 
     /// Apply a queued edit to the document through the undo history.
     fn apply_edit(&mut self, edit: TaskEdit) {
+        self.finish_drag();
+        self.finish_value_gesture();
         match edit {
             TaskEdit::Title(value) => {
                 self.host.apply(|document| document.title = value);
@@ -442,27 +492,6 @@ impl ProjectApp {
                     }
                 });
             }
-            TaskEdit::Start(id, value) => {
-                self.host.apply(|document| {
-                    if let Some(task) = document.task_mut(id) {
-                        task.start_day = value;
-                    }
-                });
-            }
-            TaskEdit::Duration(id, value) => {
-                self.host.apply(|document| {
-                    if let Some(task) = document.task_mut(id) {
-                        task.duration_days = value;
-                    }
-                });
-            }
-            TaskEdit::Progress(id, value) => {
-                self.host.apply(|document| {
-                    if let Some(task) = document.task_mut(id) {
-                        task.progress = value;
-                    }
-                });
-            }
             TaskEdit::Notes(id, value) => {
                 self.host.apply(|document| {
                     if let Some(task) = document.task_mut(id) {
@@ -474,13 +503,6 @@ impl ProjectApp {
                 self.host.apply(|document| {
                     if let Some(task) = document.task_mut(id) {
                         task.resource = value;
-                    }
-                });
-            }
-            TaskEdit::Cost(id, value) => {
-                self.host.apply(|document| {
-                    if let Some(task) = document.task_mut(id) {
-                        task.cost = value;
                     }
                 });
             }
@@ -507,7 +529,59 @@ impl ProjectApp {
         }
     }
 
+    fn flush_text_edits(&mut self) {
+        if self.title_buffer != self.host.document().title {
+            self.apply_edit(TaskEdit::Title(self.title_buffer.clone()));
+        }
+        let tasks = self.host.document().tasks.clone();
+        let mut message = None;
+        for task in tasks {
+            if let Some(value) = self.name_buffers.get(&task.id)
+                && value != &task.name
+            {
+                if value.trim().is_empty() {
+                    self.name_buffers.insert(task.id, task.name.clone());
+                    message = Some("Task name cannot be empty".to_owned());
+                } else {
+                    self.apply_edit(TaskEdit::Name(task.id, value.clone()));
+                }
+            }
+            if let Some(value) = self.dep_buffers.get(&task.id)
+                && value != &format_dependencies(&task.dependencies)
+            {
+                match parse_dependencies(value).and_then(|ids| {
+                    validate_dependency_change(self.host.document(), task.id, &ids).map(|()| ids)
+                }) {
+                    Ok(ids) if ids != task.dependencies => {
+                        self.apply_edit(TaskEdit::Dependencies(task.id, ids));
+                    }
+                    Ok(_) => {}
+                    Err(error) => {
+                        self.dep_buffers
+                            .insert(task.id, format_dependencies(&task.dependencies));
+                        message = Some(error);
+                    }
+                }
+            }
+            if let Some(value) = self.notes_buffers.get(&task.id)
+                && value != &task.notes
+            {
+                self.apply_edit(TaskEdit::Notes(task.id, value.clone()));
+            }
+            if let Some(value) = self.resource_buffers.get(&task.id)
+                && value != &task.resource
+            {
+                self.apply_edit(TaskEdit::Resource(task.id, value.clone()));
+            }
+        }
+        if let Some(message) = message {
+            self.shell.set_status(message);
+        }
+    }
+
     fn handle_action(&mut self, action: Action) {
+        self.finish_drag();
+        self.finish_value_gesture();
         match action {
             Action::New => self.request_new(),
             Action::Open => self.request_open(),
@@ -532,41 +606,17 @@ impl ProjectApp {
                     self.shell.set_status("Redo");
                 }
             }
+            Action::AddTask => self.add_task(),
+            Action::AddMilestone => self.add_milestone(),
+            Action::DuplicateSelected => self.duplicate_selected(),
+            Action::MoveUp => self.move_selected(-1),
+            Action::MoveDown => self.move_selected(1),
             Action::About => self.shell.open_about(),
             Action::Settings => self.shell.open_settings(),
         }
     }
 
-    fn handle_shortcuts(&mut self, ui: &egui::Ui) {
-        if ui.ctx().egui_wants_keyboard_input() {
-            return;
-        }
-        let action = ui.input_mut(|input| {
-            if input.consume_key(
-                egui::Modifiers::COMMAND | egui::Modifiers::SHIFT,
-                egui::Key::S,
-            ) {
-                Some(Action::SaveAs)
-            } else if input.consume_key(egui::Modifiers::COMMAND, egui::Key::S) {
-                Some(Action::Save)
-            } else if input.consume_key(egui::Modifiers::COMMAND, egui::Key::O) {
-                Some(Action::Open)
-            } else if input.consume_key(egui::Modifiers::COMMAND, egui::Key::N) {
-                Some(Action::New)
-            } else if input.consume_key(egui::Modifiers::COMMAND, egui::Key::Z) {
-                Some(Action::Undo)
-            } else if input.consume_key(egui::Modifiers::COMMAND, egui::Key::Y) {
-                Some(Action::Redo)
-            } else {
-                None
-            }
-        });
-        if let Some(action) = action {
-            self.handle_action(action);
-        }
-    }
-
-    fn top_bar(&mut self, ui: &mut egui::Ui) {
+    fn top_bar(&mut self, ui: &mut egui::Ui) -> Option<Action> {
         let title = self.host.display_name();
         let dirty = self.host.is_dirty();
         let can_undo = self.host.can_undo();
@@ -612,9 +662,7 @@ impl ProjectApp {
                 action = Some(Action::Settings);
             }
         });
-        if let Some(action) = action {
-            self.handle_action(action);
-        }
+        action
     }
 
     fn status_bar(&mut self, ui: &mut egui::Ui) {
@@ -652,6 +700,7 @@ impl ProjectApp {
             let selected = &mut self.selected;
 
             ScrollArea::horizontal()
+                .id_salt("task_table")
                 .auto_shrink([false, true])
                 .show(ui, |ui| {
                     ui.set_min_width(TABLE_WIDTH);
@@ -663,11 +712,7 @@ impl ProjectApp {
                             (SortKey::Start, START_WIDTH),
                             (SortKey::Duration, DURATION_WIDTH),
                         ] {
-                            let label = if self.sort == key {
-                                format!("{} ▾", key.label())
-                            } else {
-                                key.label().to_owned()
-                            };
+                            let label = sort_header_label(key, self.sort == key);
                             if ui
                                 .add_sized([width, CELL_HEIGHT], egui::Button::new(label))
                                 .clicked()
@@ -695,11 +740,7 @@ impl ProjectApp {
                     for task in &tasks {
                         ui.horizontal(|ui| {
                             let is_selected = *selected == Some(task.id);
-                            let label = if task.milestone {
-                                format!("◆ {}", task.id)
-                            } else {
-                                task.id.to_string()
-                            };
+                            let label = task_id_label(task.id, task.milestone);
                             let id_button = egui::Button::new(label).fill(if is_selected {
                                 theme::ACCENT
                             } else {
@@ -715,27 +756,45 @@ impl ProjectApp {
                             let response =
                                 ui.add_sized([NAME_WIDTH, CELL_HEIGHT], TextEdit::singleline(name));
                             if response.lost_focus() && name != &task.name {
-                                edits.push(TaskEdit::Name(task.id, name.clone()));
+                                if name.trim().is_empty() {
+                                    messages.push("Task name cannot be empty".to_owned());
+                                    *name = task.name.clone();
+                                } else {
+                                    edits.push(TaskEdit::Name(task.id, name.clone()));
+                                }
                             }
 
                             let mut start = task.start_day;
-                            if ui
-                                .add_sized([START_WIDTH, CELL_HEIGHT], DragValue::new(&mut start))
-                                .changed()
+                            let response =
+                                ui.add_sized([START_WIDTH, CELL_HEIGHT], DragValue::new(&mut start));
+                            begin_value_gesture(&mut self.host, &mut self.value_gesture, &response);
+                            if response.changed()
+                                && let Some(current) =
+                                    self.host.history_mut().current_mut().task_mut(task.id)
                             {
-                                edits.push(TaskEdit::Start(task.id, start));
+                                current.start_day = start;
                             }
+                            finish_value_gesture_if(&mut self.host, &mut self.value_gesture, &response);
 
                             let mut duration = task.duration_days;
-                            if ui
-                                .add_sized(
-                                    [DURATION_WIDTH, CELL_HEIGHT],
-                                    DragValue::new(&mut duration).range(0..=3650),
-                                )
-                                .changed()
-                            {
-                                edits.push(TaskEdit::Duration(task.id, duration));
+                            let response = ui.add_sized(
+                                [DURATION_WIDTH, CELL_HEIGHT],
+                                DragValue::new(&mut duration).range(0..=3650),
+                            );
+                            begin_value_gesture(&mut self.host, &mut self.value_gesture, &response);
+                            if response.changed() {
+                                if task.milestone && duration != 0 {
+                                    messages.push(
+                                        "Milestones must have zero duration; uncheck Milestone to set days"
+                                            .to_owned(),
+                                    );
+                                } else if let Some(current) =
+                                    self.host.history_mut().current_mut().task_mut(task.id)
+                                {
+                                    current.duration_days = duration;
+                                }
                             }
+                            finish_value_gesture_if(&mut self.host, &mut self.value_gesture, &response);
 
                             let dependencies = dep_buffers
                                 .entry(task.id)
@@ -746,7 +805,10 @@ impl ProjectApp {
                             );
                             if response.lost_focus() {
                                 let raw = dependencies.clone();
-                                match parse_dependencies(&raw) {
+                                match parse_dependencies(&raw).and_then(|ids| {
+                                    validate_dependency_change(self.host.document(), task.id, &ids)
+                                        .map(|()| ids)
+                                }) {
                                     Ok(ids) => {
                                         if ids != task.dependencies {
                                             edits.push(TaskEdit::Dependencies(task.id, ids));
@@ -765,18 +827,18 @@ impl ProjectApp {
                                 vec2(PROGRESS_WIDTH, CELL_HEIGHT),
                                 Layout::left_to_right(Align::Center),
                                 |ui| {
-                                    if ui
-                                        .add_sized(
-                                            [72.0, CELL_HEIGHT],
-                                            DragValue::new(&mut percent).range(0..=100).suffix("%"),
-                                        )
-                                        .changed()
+                                    let response = ui.add_sized(
+                                        [72.0, CELL_HEIGHT],
+                                        DragValue::new(&mut percent).range(0..=100).suffix("%"),
+                                    );
+                                    begin_value_gesture(&mut self.host, &mut self.value_gesture, &response);
+                                    if response.changed()
+                                        && let Some(current) =
+                                            self.host.history_mut().current_mut().task_mut(task.id)
                                     {
-                                        edits.push(TaskEdit::Progress(
-                                            task.id,
-                                            percent as f32 / 100.0,
-                                        ));
+                                        current.progress = percent as f32 / 100.0;
                                     }
+                                    finish_value_gesture_if(&mut self.host, &mut self.value_gesture, &response);
                                     ui.add_sized(
                                         [30.0, 12.0],
                                         egui::ProgressBar::new(task.progress.clamp(0.0, 1.0)),
@@ -784,10 +846,11 @@ impl ProjectApp {
                                 },
                             );
 
-                            if ui
-                                .add_sized([DELETE_WIDTH, CELL_HEIGHT], egui::Button::new("x"))
-                                .clicked()
-                            {
+                            let delete_response = ui.add_sized(
+                                [DELETE_WIDTH, CELL_HEIGHT],
+                                egui::Button::new("x"),
+                            );
+                            if delete_response.on_hover_text("Delete task").clicked() {
                                 to_delete.push(task.id);
                             }
                         });
@@ -800,7 +863,13 @@ impl ProjectApp {
     }
 
     /// Inspector for the selected task: milestone, notes, resource, cost.
-    fn details_panel(&mut self, ui: &mut egui::Ui, result: &Schedule, edits: &mut Vec<TaskEdit>) {
+    fn details_panel(
+        &mut self,
+        ui: &mut egui::Ui,
+        result: &Schedule,
+        edits: &mut Vec<TaskEdit>,
+        actions: &mut Vec<Action>,
+    ) {
         let Some(id) = self.selected else {
             ui.label(RichText::new("Select a task to edit its details.").color(theme::FAINT));
             return;
@@ -814,13 +883,13 @@ impl ProjectApp {
         ui.horizontal(|ui| {
             ui.heading("Task details");
             if ui.small_button("Duplicate").clicked() {
-                self.duplicate_selected();
+                actions.push(Action::DuplicateSelected);
             }
             if ui.small_button("Move up").clicked() {
-                self.move_selected(-1);
+                actions.push(Action::MoveUp);
             }
             if ui.small_button("Move down").clicked() {
-                self.move_selected(1);
+                actions.push(Action::MoveDown);
             }
         });
 
@@ -844,16 +913,18 @@ impl ProjectApp {
             }
             ui.label("Cost");
             let mut cost = task.cost;
-            if ui
-                .add(
-                    DragValue::new(&mut cost)
-                        .range(0.0..=1_000_000.0)
-                        .prefix("¤"),
-                )
-                .changed()
+            let response = ui.add(
+                DragValue::new(&mut cost)
+                    .range(0.0..=1_000_000.0)
+                    .prefix("¤"),
+            );
+            begin_value_gesture(&mut self.host, &mut self.value_gesture, &response);
+            if response.changed()
+                && let Some(current) = self.host.history_mut().current_mut().task_mut(id)
             {
-                edits.push(TaskEdit::Cost(id, cost));
+                current.cost = cost;
             }
+            finish_value_gesture_if(&mut self.host, &mut self.value_gesture, &response);
         });
 
         ui.horizontal(|ui| {
@@ -878,7 +949,7 @@ impl ProjectApp {
             let finish = calendar.label_for_day(timing.earliest_finish);
             ui.label(
                 RichText::new(format!(
-                    "Earliest {earliest} → {finish}  •  float {} day(s)  •  {}",
+                    "Earliest {earliest} to {finish}  |  float {} day(s)  |  {}",
                     timing.total_float,
                     if timing.is_critical() {
                         "critical"
@@ -898,7 +969,7 @@ impl ProjectApp {
             ui.label("Start date");
             let mut enabled = calendar.start_date.is_some();
             if ui.checkbox(&mut enabled, "Real dates").changed() {
-                let date = enabled.then(|| Date::new(2026, 11, 23).expect("valid date"));
+                let date = enabled.then(Date::today);
                 edits.push(TaskEdit::CalendarStart(date));
             }
             if let Some(date) = calendar.start_date {
@@ -936,7 +1007,7 @@ impl ProjectApp {
 
     fn gantt(&mut self, ui: &mut egui::Ui, result: &Schedule) {
         let tasks = self.host.document().tasks.clone();
-        let days = result.project_duration.max(1);
+        let days = result.day_span().max(1);
         let available_width = ui.available_width();
         let day_width = self.zoom.day_width(days, available_width);
         let content_width = LABEL_WIDTH + days as f32 * day_width + 24.0;
@@ -956,18 +1027,17 @@ impl ProjectApp {
                 }
             }
             ui.label(
-                RichText::new("Click a bar to select • drag to reschedule").color(theme::FAINT),
+                RichText::new("Click a bar to select; drag it to reschedule.").color(theme::FAINT),
             );
         });
 
         ScrollArea::both()
+            .id_salt("gantt")
             .auto_shrink([false, false])
             .max_height(360.0)
             .show(ui, |ui| {
-                let (rect, response) = ui.allocate_exact_size(
-                    Vec2::new(content_width, content_height),
-                    Sense::click_and_drag(),
-                );
+                let (rect, _response) = ui
+                    .allocate_exact_size(Vec2::new(content_width, content_height), Sense::hover());
                 let painter = ui.painter_at(rect);
                 painter.rect_filled(rect, CornerRadius::ZERO, theme::SUNKEN);
 
@@ -984,9 +1054,12 @@ impl ProjectApp {
 
                 let header = Rect::from_min_size(rect.min, vec2(content_width, HEADER_HEIGHT));
                 painter.rect_filled(header, CornerRadius::ZERO, theme::RAISED);
-                let step = self.zoom.ruler_step(days).max(1);
-                for day in (0..=days).step_by(step) {
-                    let x = day_x(day, rect.min.x + LABEL_WIDTH, day_width);
+                let step = self.zoom.ruler_step(days).max(1) as i64;
+                let tick_count = days / step;
+                for tick in 0..=tick_count {
+                    let offset = tick * step;
+                    let day = result.first_day().saturating_add(offset);
+                    let x = day_x(offset, rect.min.x + LABEL_WIDTH, day_width);
                     painter.line_segment(
                         [pos2(x, rect.min.y), pos2(x, rect.max.y)],
                         Stroke::new(1.0, theme::BORDER),
@@ -1007,6 +1080,9 @@ impl ProjectApp {
                     theme::FAINT,
                 );
 
+                let mut label_hits = Vec::with_capacity(tasks.len());
+                let mut bar_hits = Vec::with_capacity(tasks.len());
+
                 // Task labels and row selection.
                 for (row, task) in tasks.iter().enumerate() {
                     let center_y =
@@ -1014,11 +1090,7 @@ impl ProjectApp {
                     painter.text(
                         pos2(rect.min.x + 8.0, center_y),
                         Align2::LEFT_CENTER,
-                        if self.selected == Some(task.id) {
-                            format!("▸ {}", task.name)
-                        } else {
-                            task.name.clone()
-                        },
+                        gantt_task_label(&task.name, self.selected == Some(task.id)),
                         font.clone(),
                         if result
                             .task(task.id)
@@ -1029,6 +1101,11 @@ impl ProjectApp {
                             theme::TEXT
                         },
                     );
+                    let label_rect = Rect::from_min_size(
+                        pos2(rect.min.x, center_y - ROW_HEIGHT / 2.0),
+                        vec2(LABEL_WIDTH, ROW_HEIGHT),
+                    );
+                    label_hits.push((task.id, label_rect));
                 }
 
                 // Dependency arrows, drawn behind the bars.
@@ -1038,7 +1115,11 @@ impl ProjectApp {
                     };
                     let to_y =
                         rect.min.y + HEADER_HEIGHT + row as f32 * ROW_HEIGHT + ROW_HEIGHT / 2.0;
-                    let to_x = day_x(timing.earliest_start, rect.min.x + LABEL_WIDTH, day_width);
+                    let to_x = day_x(
+                        result.day_offset(timing.earliest_start),
+                        rect.min.x + LABEL_WIDTH,
+                        day_width,
+                    );
                     for dependency in &task.dependencies {
                         let Some(parent_index) =
                             tasks.iter().position(|item| item.id == *dependency)
@@ -1052,8 +1133,11 @@ impl ProjectApp {
                             + HEADER_HEIGHT
                             + parent_index as f32 * ROW_HEIGHT
                             + ROW_HEIGHT / 2.0;
-                        let from_x =
-                            day_x(parent.earliest_finish, rect.min.x + LABEL_WIDTH, day_width);
+                        let from_x = day_x(
+                            result.day_offset(parent.earliest_finish),
+                            rect.min.x + LABEL_WIDTH,
+                            day_width,
+                        );
                         let points = arrow_points((from_x, from_y), (to_x, to_y));
                         for pair in points.windows(2) {
                             painter.line_segment(
@@ -1069,7 +1153,7 @@ impl ProjectApp {
                     }
                 }
 
-                // Bars, milestones and drag interaction.
+                // Bars, milestones and precise interaction regions.
                 for (row, task) in tasks.iter().enumerate() {
                     let Some(timing) = result.task(task.id) else {
                         continue;
@@ -1077,13 +1161,14 @@ impl ProjectApp {
                     let center_y =
                         rect.min.y + HEADER_HEIGHT + row as f32 * ROW_HEIGHT + ROW_HEIGHT / 2.0;
                     let (left, top, right, bottom) = bar_rect(
-                        timing.earliest_start,
-                        timing.earliest_finish,
+                        result.day_offset(timing.earliest_start),
+                        result.day_offset(timing.earliest_finish),
                         rect.min.x + LABEL_WIDTH,
                         center_y,
                         day_width,
                     );
                     let bar = Rect::from_min_max(pos2(left, top), pos2(right, bottom));
+                    let selected = self.selected == Some(task.id);
 
                     let color = if timing.is_critical() {
                         theme::ACCENT
@@ -1099,9 +1184,25 @@ impl ProjectApp {
                             pos2(mid, center_y + half),
                             pos2(mid - half, center_y),
                         ];
-                        painter.add(Shape::convex_polygon(diamond, color, Stroke::NONE));
+                        painter.add(Shape::convex_polygon(
+                            diamond,
+                            color,
+                            if selected {
+                                Stroke::new(2.0, theme::ACCENT_LIGHT)
+                            } else {
+                                Stroke::NONE
+                            },
+                        ));
                     } else {
                         painter.rect_filled(bar, CornerRadius::same(4), color);
+                        if selected {
+                            painter.rect_stroke(
+                                bar,
+                                CornerRadius::same(4),
+                                Stroke::new(2.0, theme::ACCENT_LIGHT),
+                                egui::StrokeKind::Inside,
+                            );
+                        }
                         if task.progress > 0.0 {
                             let width = bar.width() * task.progress.clamp(0.0, 1.0);
                             let done = Rect::from_min_size(bar.min, vec2(width, bar.height()));
@@ -1109,50 +1210,100 @@ impl ProjectApp {
                         }
                     }
                     if !timing.is_critical() && timing.total_float > 0 {
-                        let slack_end =
-                            day_x(timing.latest_finish, rect.min.x + LABEL_WIDTH, day_width);
+                        let slack_end = day_x(
+                            result.day_offset(timing.latest_finish),
+                            rect.min.x + LABEL_WIDTH,
+                            day_width,
+                        );
                         painter.line_segment(
                             [pos2(right, center_y), pos2(slack_end, center_y)],
                             Stroke::new(2.0, theme::FAINT),
                         );
                     }
+                    let hit_rect = Rect::from_min_max(
+                        pos2(left - 8.0, center_y - ROW_HEIGHT / 2.0),
+                        pos2(right + 8.0, center_y + ROW_HEIGHT / 2.0),
+                    );
+                    bar_hits.push((task.id, hit_rect, timing.earliest_start, task.name.clone()));
                 }
 
-                // Start or continue a reschedule gesture from the bar drag.
-                if let Some(pointer) = response.interact_pointer_pos() {
+                for (task_id, label_rect) in label_hits {
+                    let response = ui.interact(
+                        label_rect,
+                        ui.scope_id().with(("gantt-label", task_id)),
+                        Sense::click(),
+                    );
+                    if response.clicked() {
+                        self.selected = Some(task_id);
+                    }
+                    response.on_hover_cursor(egui::CursorIcon::PointingHand);
+                }
+
+                for (task_id, hit_rect, earliest_start, name) in bar_hits {
+                    let response = ui.interact(
+                        hit_rect,
+                        ui.scope_id().with(("gantt-bar", task_id)),
+                        Sense::click_and_drag(),
+                    );
+                    if response.clicked() {
+                        self.selected = Some(task_id);
+                    }
                     if response.drag_started() {
-                        let relative_y = pointer.y - rect.min.y;
-                        if let Some(row) = row_at(relative_y)
-                            && let Some(task) = tasks.get(row)
-                        {
+                        self.finish_drag();
+                        self.finish_value_gesture();
+                        if let Some(pointer) = response.interact_pointer_pos() {
                             self.host.history_mut().begin_gesture();
                             self.drag = Some(DragState {
-                                task_id: task.id,
+                                task_id,
                                 pointer_x: pointer.x,
-                                original_start: task.start_day,
+                                day_width,
+                                original_earliest_start: earliest_start,
+                                original_release: self
+                                    .host
+                                    .document()
+                                    .task(task_id)
+                                    .map_or(earliest_start, |task| task.start_day),
                             });
-                            self.selected = Some(task.id);
+                            self.selected = Some(task_id);
                         }
                     }
-                    if let Some(drag) = self.drag
+                    if self.drag.is_some_and(|drag| drag.task_id == task_id)
                         && response.dragged()
+                        && let Some(pointer) = response.interact_pointer_pos()
+                        && let Some(drag) = self.drag
                     {
-                        let delta = drag_delta_days(drag.pointer_x, pointer.x, day_width);
+                        let delta = drag_delta_days(drag.pointer_x, pointer.x, drag.day_width);
                         if let Some(task) =
                             self.host.history_mut().current_mut().task_mut(drag.task_id)
                         {
-                            task.start_day = drag.original_start + delta;
+                            task.start_day = drag_target_start(drag.original_earliest_start, delta);
                         }
                     }
+                    if self.drag.is_some_and(|drag| drag.task_id == task_id)
+                        && response.drag_stopped()
+                    {
+                        self.finish_drag();
+                    }
+                    if self.drag.is_some_and(|drag| drag.task_id == task_id) {
+                        response.on_hover_cursor(egui::CursorIcon::Grabbing);
+                    } else {
+                        response
+                            .on_hover_cursor(egui::CursorIcon::Grab)
+                            .on_hover_text(format!(
+                                "{name}\nScheduled start: {}\nDrag to reschedule.",
+                                calendar.label_for_day(earliest_start)
+                            ));
+                    }
                 }
-                if response.drag_stopped() && self.drag.take().is_some() {
-                    self.host.history_mut().end_gesture();
-                    self.shell.set_status("Bar rescheduled");
+
+                // A focus loss can omit the normal drag-stopped response.
+                if self.drag.is_some() && ui.input(|input| !input.pointer.any_down()) {
+                    self.finish_drag();
                 }
             });
     }
 
-    fn central_panel(&mut self, ui: &mut egui::Ui) {
+    fn central_panel(&mut self, ui: &mut egui::Ui, actions: &mut Vec<Action>) {
         let mut edits = Vec::new();
         let mut messages = Vec::new();
 
@@ -1161,16 +1312,16 @@ impl ProjectApp {
                 ui.heading("Task plan");
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                     if widgets::toolbar_button(ui, "PDF", "Export the Gantt as PDF").clicked() {
-                        self.export_pdf();
+                        actions.push(Action::ExportPdf);
                     }
                     if widgets::toolbar_button(ui, "CSV", "Export the task table").clicked() {
-                        self.export_csv();
+                        actions.push(Action::ExportCsv);
                     }
                     if widgets::toolbar_button(ui, "Milestone", "Add a milestone").clicked() {
-                        self.add_milestone();
+                        actions.push(Action::AddMilestone);
                     }
                     if widgets::toolbar_button(ui, "Add task", "Append a new task").clicked() {
-                        self.add_task();
+                        actions.push(Action::AddTask);
                     }
                 });
             });
@@ -1193,8 +1344,8 @@ impl ProjectApp {
                     let cost = self.host.document().total_cost();
                     ui.label(
                         RichText::new(format!(
-                            "Duration: {} days  •  Critical: {critical}  •  Cost: {cost:.2}",
-                            result.project_duration
+                            "Duration: {} days  |  Critical: {critical}  |  Cost: {cost:.2}",
+                            result.day_span()
                         ))
                         .color(theme::MUTED),
                     );
@@ -1206,7 +1357,7 @@ impl ProjectApp {
                         );
                     } else {
                         self.task_table(ui, &mut edits, &mut messages);
-                        self.details_panel(ui, &result, &mut edits);
+                        self.details_panel(ui, &result, &mut edits, actions);
                         ui.separator();
                         self.gantt(ui, &result);
                     }
@@ -1224,6 +1375,43 @@ impl ProjectApp {
         }
         for message in messages {
             self.shell.set_status(message);
+        }
+        if actions.iter().any(|action| {
+            matches!(
+                action,
+                Action::New
+                    | Action::Open
+                    | Action::Save
+                    | Action::SaveAs
+                    | Action::ImportCsv
+                    | Action::ExportCsv
+                    | Action::ExportPdf
+            )
+        }) {
+            self.flush_text_edits();
+        }
+        for action in actions.drain(..) {
+            self.handle_action(action);
+        }
+    }
+
+    fn handle_close_request(&mut self, ui: &egui::Ui) {
+        if !ui.input(|input| input.viewport().close_requested()) {
+            return;
+        }
+        if self.allow_close_once {
+            self.allow_close_once = false;
+            return;
+        }
+        self.finish_drag();
+        self.finish_value_gesture();
+        self.flush_text_edits();
+        if self.pending.is_some() || self.host.is_dirty() {
+            ui.ctx()
+                .send_viewport_cmd(egui::ViewportCommand::CancelClose);
+            if self.pending.is_none() {
+                self.pending = Some(PendingAction::Exit);
+            }
         }
     }
 
@@ -1254,7 +1442,7 @@ impl ProjectApp {
                 });
             });
         if let Some(choice) = choice {
-            self.resolve_pending(choice);
+            self.resolve_pending(choice, ctx);
         } else if !open {
             self.pending = None;
         }
@@ -1263,15 +1451,117 @@ impl ProjectApp {
 
 impl eframe::App for ProjectApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
-        self.handle_shortcuts(ui);
-        self.top_bar(ui);
+        let mut actions = Vec::new();
+        if let Some(action) = shortcut_action(ui) {
+            actions.push(action);
+        }
+        if let Some(action) = self.top_bar(ui) {
+            actions.push(action);
+        }
         self.status_bar(ui);
-        self.central_panel(ui);
+        self.central_panel(ui, &mut actions);
+        self.handle_close_request(ui);
         self.unsaved_window(ui.ctx());
         self.shell.show_windows(ui.ctx());
         self.shell
             .update_title(ui.ctx(), &self.host.display_name(), self.host.is_dirty());
     }
+}
+
+fn shortcut_action(ui: &egui::Ui) -> Option<Action> {
+    // Read context memory before taking egui's mutable input lock.
+    let wants_keyboard_input = ui.ctx().egui_wants_keyboard_input();
+    ui.input_mut(|input| {
+        if input.consume_key(
+            egui::Modifiers::COMMAND | egui::Modifiers::SHIFT,
+            egui::Key::S,
+        ) {
+            Some(Action::SaveAs)
+        } else if input.consume_key(egui::Modifiers::COMMAND, egui::Key::S) {
+            Some(Action::Save)
+        } else if wants_keyboard_input {
+            None
+        } else if input.consume_key(
+            egui::Modifiers::COMMAND | egui::Modifiers::SHIFT,
+            egui::Key::Z,
+        ) {
+            Some(Action::Redo)
+        } else if input.consume_key(egui::Modifiers::COMMAND, egui::Key::O) {
+            Some(Action::Open)
+        } else if input.consume_key(egui::Modifiers::COMMAND, egui::Key::N) {
+            Some(Action::New)
+        } else if input.consume_key(egui::Modifiers::COMMAND, egui::Key::Z) {
+            Some(Action::Undo)
+        } else if input.consume_key(egui::Modifiers::COMMAND, egui::Key::Y) {
+            Some(Action::Redo)
+        } else {
+            None
+        }
+    })
+}
+
+fn begin_value_gesture(
+    host: &mut DocumentHost<Document>,
+    active: &mut bool,
+    response: &egui::Response,
+) {
+    if !*active && (response.gained_focus() || response.drag_started() || response.changed()) {
+        host.history_mut().begin_gesture();
+        *active = true;
+    }
+}
+
+fn finish_value_gesture(host: &mut DocumentHost<Document>, active: &mut bool) {
+    if *active {
+        host.history_mut().end_gesture();
+        *active = false;
+    }
+}
+
+fn finish_value_gesture_if(
+    host: &mut DocumentHost<Document>,
+    active: &mut bool,
+    response: &egui::Response,
+) {
+    if response.drag_stopped() || response.lost_focus() {
+        finish_value_gesture(host, active);
+    }
+}
+
+fn replace_with_import(host: &mut DocumentHost<Document>, document: Document) {
+    let previous = host.document().clone();
+    *host = DocumentHost::new(Document::default(), FORMAT, SCHEMA_VERSION, APP_VERSION);
+    host.apply(|current| *current = previous);
+    host.apply(|current| *current = document);
+}
+
+fn sort_header_label(key: SortKey, selected: bool) -> String {
+    if selected {
+        format!("{} v", key.label())
+    } else {
+        key.label().to_owned()
+    }
+}
+
+fn task_id_label(id: u64, milestone: bool) -> String {
+    if milestone {
+        format!("M {id}")
+    } else {
+        id.to_string()
+    }
+}
+
+fn gantt_task_label(name: &str, selected: bool) -> String {
+    let mut label = String::new();
+    if selected {
+        label.push_str("> ");
+    }
+    let maximum_name_characters = 26;
+    label.extend(name.chars().take(maximum_name_characters));
+    if name.chars().count() > maximum_name_characters {
+        label.push_str("...");
+    }
+    label
 }
 
 fn slugify(title: &str) -> String {
@@ -1301,8 +1591,60 @@ mod tests {
     }
 
     #[test]
+    fn shortcut_polling_does_not_deadlock_the_egui_context() {
+        let context = egui::Context::default();
+        let mut output = context.run_ui(egui::RawInput::default(), |context| {
+            egui::CentralPanel::default().show(context, |ui| {
+                assert!(shortcut_action(ui).is_none());
+            });
+        });
+        output.textures_delta.clear();
+    }
+
+    #[test]
     fn slugify_produces_a_safe_file_name() {
         assert_eq!(slugify("Sample project!"), "sample-project");
         assert_eq!(slugify("  "), "untitled");
+    }
+
+    #[test]
+    fn ui_markers_do_not_depend_on_missing_font_glyphs() {
+        assert!(sort_header_label(SortKey::Name, true).is_ascii());
+        assert!(task_id_label(7, true).is_ascii());
+        assert!(gantt_task_label("Implementation", true).is_ascii());
+        assert_eq!(gantt_task_label("Implementation", true), "> Implementation");
+    }
+
+    #[test]
+    fn long_gantt_labels_are_bounded() {
+        let label = gantt_task_label(&"x".repeat(100), false);
+        assert!(label.ends_with("..."));
+        assert!(label.chars().count() <= 29);
+    }
+
+    #[test]
+    fn csv_import_is_unsaved_and_does_not_overwrite_the_open_project() {
+        let path =
+            std::env::temp_dir().join(format!("projectcraft-import-{}.json", std::process::id()));
+        let mut host = DocumentHost::new(Document::sample(), FORMAT, SCHEMA_VERSION, APP_VERSION);
+        host.save_as(&path).expect("save original");
+        host.apply(|document| document.title = "Unsaved previous".into());
+        let previous = host.document().clone();
+        let imported = Document {
+            title: "Imported project".into(),
+            ..Document::default()
+        };
+
+        replace_with_import(&mut host, imported.clone());
+
+        assert!(host.path().is_none());
+        assert!(host.is_dirty());
+        assert_eq!(host.document(), &imported);
+        assert!(host.undo());
+        assert_eq!(host.document(), &previous);
+        assert!(host.is_dirty());
+        assert!(host.redo());
+        assert_eq!(host.document(), &imported);
+        let _ = std::fs::remove_file(path);
     }
 }

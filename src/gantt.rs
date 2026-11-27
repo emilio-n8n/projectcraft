@@ -54,9 +54,11 @@ impl Zoom {
     }
 
     /// Day interval between ruler labels.
+    ///
+    /// Very long plans use a coarser step so drawing the ruler remains bounded.
     #[must_use]
     pub fn ruler_step(self, days: i64) -> usize {
-        match self {
+        let preferred = match self {
             Self::Day => 1,
             Self::Week => 7,
             Self::Month => 30,
@@ -69,7 +71,14 @@ impl Zoom {
                     1
                 }
             }
+        };
+        if days <= 0 {
+            return preferred;
         }
+        let maximum_ticks = 120_i128;
+        let minimum_step = ((i128::from(days) + maximum_ticks - 1) / maximum_ticks)
+            .clamp(1, usize::MAX as i128) as usize;
+        preferred.max(minimum_step)
     }
 }
 
@@ -93,20 +102,24 @@ pub fn bar_rect(
     (left, center_y - 7.0, right, center_y + 7.0)
 }
 
-/// Row under a pointer position relative to the canvas top.
-#[must_use]
-pub fn row_at(relative_y: f32) -> Option<usize> {
-    if relative_y < HEADER_HEIGHT {
-        return None;
-    }
-    let row = ((relative_y - HEADER_HEIGHT) / ROW_HEIGHT) as usize;
-    (row < 8_192).then_some(row)
-}
-
 /// Whole-day shift produced by dragging a bar.
 #[must_use]
 pub fn drag_delta_days(start_x: f32, current_x: f32, day_width: f32) -> i64 {
+    if !day_width.is_finite() || day_width <= 0.0 || !start_x.is_finite() || !current_x.is_finite()
+    {
+        return 0;
+    }
     ((current_x - start_x) / day_width).round() as i64
+}
+
+/// New release day for a dragged bar.
+///
+/// The visible bar starts at the CPM earliest start, not necessarily at the
+/// authored release day. Basing the gesture on the latter makes dependent
+/// tasks appear not to move.
+#[must_use]
+pub fn drag_target_start(earliest_start: i64, delta: i64) -> i64 {
+    earliest_start.saturating_add(delta)
 }
 
 /// Orthogonal dependency arrow from a predecessor to a successor.
@@ -148,17 +161,29 @@ mod tests {
     }
 
     #[test]
-    fn row_hit_test_ignores_the_ruler() {
-        assert_eq!(row_at(10.0), None);
-        assert_eq!(row_at(HEADER_HEIGHT), Some(0));
-        assert_eq!(row_at(HEADER_HEIGHT + ROW_HEIGHT * 2.0 + 1.0), Some(2));
-    }
-
-    #[test]
     fn drag_delta_rounds_to_whole_days() {
         assert_eq!(drag_delta_days(100.0, 141.0, 20.0), 2);
         assert_eq!(drag_delta_days(100.0, 89.0, 20.0), -1);
         assert_eq!(drag_delta_days(100.0, 100.0, 20.0), 0);
+        assert_eq!(drag_delta_days(100.0, 120.0, 0.0), 0);
+        assert_eq!(drag_delta_days(f32::NAN, 120.0, 20.0), 0);
+    }
+
+    #[test]
+    fn dragging_uses_the_visible_cpm_start() {
+        assert_eq!(drag_target_start(5, 2), 7);
+        assert_eq!(drag_target_start(5, -3), 2);
+        assert_eq!(drag_target_start(i64::MAX, 1), i64::MAX);
+        assert_eq!(drag_target_start(i64::MIN, -1), i64::MIN);
+    }
+
+    #[test]
+    fn ruler_steps_stay_bounded_for_extreme_plans() {
+        for zoom in Zoom::all() {
+            let step = zoom.ruler_step(i64::MAX);
+            assert!(step > 0);
+            assert!(i128::from(i64::MAX) / step as i128 <= 120);
+        }
     }
 
     #[test]

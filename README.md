@@ -17,17 +17,21 @@ desktop foundation.
   the dependency graph.
 - Critical Path Method in whole days: earliest/latest start and finish, total
   float and critical-path detection with clear cycle diagnostics.
-- Interactive Gantt drawn with egui's `Painter`: dependency arrows, row
-  selection, bar dragging to reschedule, day/week/month/fit zoom, horizontal
-  scrolling, progress overlay, slack markers and colour-coded critical tasks.
+- Interactive Gantt drawn with egui's `Painter`: dependency arrows, clickable
+  row labels, precise bar hit-testing, bar dragging to reschedule from the
+  visible CPM start, day/week/month/fit zoom, scrolling, progress overlay,
+  slack markers and colour-coded critical tasks.
 - Optional calendar: a project start date and weekend skipping display real
   dates on the ruler without changing integer-day scheduling.
 - Task milestones (zero-duration diamonds), notes, resources and estimated
   costs; the total cost is shown in the status line.
-- CSV import and export with RFC-style quoting and descriptive row errors.
-- Vector PDF export of the Gantt for printing, with no extra dependency.
+- CSV import and export with strict quoting, column validation, exact authored
+  value round-trips, dependency checks and descriptive row errors.
+- Paginated vector PDF export of the Gantt for printing, with no extra
+  dependency and atomic file replacement.
 - Versioned JSON project files with atomic saves and schema validation.
-- Bounded undo/redo through the shared document history; a bar drag is one step.
+- Bounded undo/redo through the shared document history; bar and numeric drags
+  are each one step, with unsaved-change confirmation before closing.
 - Recent files and persisted preferences.
 - Offline-first: no account, no telemetry, no network required.
 
@@ -50,7 +54,7 @@ Without arguments the application opens an empty document.
 ```bash
 cargo fmt --all -- --check
 cargo clippy --workspace --all-targets -- -D warnings
-cargo test --workspace
+cargo test --workspace --locked
 ```
 
 Linux windowing development packages are installed by the CI workflow.
@@ -103,7 +107,9 @@ Projects are JSON envelopes:
 ```
 
 Days are signed integers; `start_day` is a release constraint and durations are
-whole days. The optional `calendar` maps day offsets to real dates for display.
+whole days. The Gantt and PDF start their ruler at the first scheduled day, so
+plans before day zero remain visible. The optional `calendar` maps day offsets
+to real dates for display.
 Fields added in v0.2 have serde defaults, so schema 1 files written by v0.1.0
 still open without a migration. A newer `schema_version` is rejected instead of
 being silently misread.

@@ -2,6 +2,35 @@
 
 All notable changes to ProjectCraft are documented here.
 
+## [Unreleased]
+
+### Fixed
+
+- Reschedule dependent tasks from their visible CPM start, restrict Gantt drags
+  to bars, preserve one undo step for Gantt/numeric gestures and finish
+  interrupted gestures safely.
+- Render signed-day plans from their first scheduled day and bound ruler work
+  for extremely long plans.
+- Reject unknown, self and cyclic dependency edits and invalid imported graphs.
+- Distinguish one percent from 100% in `progress_percent`, preserve exact CSV
+  progress/cost values, validate row widths and reject malformed quoting.
+- Calculate weekend shifts without per-day loops or `i64::MIN` overflow, and
+  reject invalid persisted calendar dates.
+- Report CPM arithmetic overflow, traverse deep cycles iteratively and enforce
+  zero-duration milestones.
+- Save and export after edits made in the same frame; confirm unsaved changes
+  before closing; CSV imports are unsaved, undoable and cannot overwrite the
+  previously open project.
+- Replace missing Ubuntu font glyphs with accessible ASCII UI markers.
+
+### Improved
+
+- Export all Gantt tasks across PDF pages, preserve Latin-1 text and write
+  CSV/PDF exports atomically.
+- Add selected-bar outlines, hover affordances, independent table/Gantt scroll
+  state, task-name validation and regression coverage for scheduling, CSV,
+  calendar, persistence and PDF.
+
 ## [0.2.0] - 2026-11-22
 
 ### Added
